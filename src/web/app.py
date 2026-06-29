@@ -1,0 +1,2734 @@
+"""
+Web Dashboard v3 — 双驾驶舱
+  驾驶舱一：素材投资决策驾驶舱 (Material Cockpit)
+    - 决策总览 / 账户穿透 / 素材全榜 / 优化建议
+  驾驶舱二：投流账户驾驶舱 (Account Cockpit)
+    - 全局KPI / 账户趋势 / 项目分析 / 单元排行
+"""
+
+import json
+import logging
+import os
+import sqlite3
+from datetime import date, timedelta
+
+from flask import Flask, jsonify, render_template_string, request, send_file, send_from_directory
+
+from src.analysis.kpi import KPIAnalyzer
+from src.analysis.material_decision import MaterialDecisionEngine
+from src.analysis.quality_radar import QualityRadar
+from src.pipeline.storage import Storage
+from src.pipeline.scheduler import AdDataScheduler, sync_status
+
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+kpi = KPIAnalyzer()
+engine = MaterialDecisionEngine()
+storage = Storage()
+radar = QualityRadar()
+
+# ── Helpers ─────────────────────────────────────────────────────
+_scheduler: AdDataScheduler | None = None
+
+def _start_scheduler():
+    global _scheduler
+    _scheduler = AdDataScheduler()
+    _scheduler.start()
+    logger.info("Auto-sync scheduler started (every 30 minutes)")
+    _scheduler.trigger_now()
+
+
+def _default_date() -> str:
+    return storage.get_latest_date("material_reports") or (
+        date.today() - timedelta(days=1)
+    ).strftime("%Y-%m-%d")
+
+
+def _db_path() -> str:
+    return os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+        "data", "ad_data.db"
+    )
+
+
+def _get_account_name_map() -> dict:
+    """Load account_id -> name from accounts table."""
+    conn = sqlite3.connect(_db_path())
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT account_id, name FROM accounts")
+    m = {r["account_id"]: r["name"] for r in c.fetchall()}
+    conn.close()
+    return m
+
+
+# ── Material Cockpit Routes ──────────────────────────────────────
+
+@app.route("/")
+def dashboard():
+    return render_template_string(DASHBOARD_HTML)
+
+
+@app.route("/static/<path:filename>")
+def static_files(filename):
+    static_dir = os.path.join(os.path.dirname(__file__), "static")
+    return send_from_directory(static_dir, filename)
+
+
+@app.route("/api/summary")
+def api_summary():
+    days = int(request.args.get("days", 7))
+    trend = kpi.trend(days)
+    today = trend[-1] if trend else {}
+    return jsonify({"today": today, "trend": trend})
+
+
+@app.route("/api/decision")
+def api_decision():
+    start_date = request.args.get("start_date")
+    end_date = request.args.get("end_date")
+    date_str = request.args.get("date") or _default_date()
+    result = engine.analyze(date_str=date_str, start_date=start_date, end_date=end_date)
+    return jsonify(result)
+
+
+@app.route("/api/account/<account_id>")
+def api_account_detail(account_id: str):
+    start_date = request.args.get("start_date")
+    end_date = request.args.get("end_date")
+    date_str = request.args.get("date") or _default_date()
+    result = engine.get_account_detail(
+        account_id, date_str=date_str,
+        start_date=start_date, end_date=end_date,
+    )
+    return jsonify(result)
+
+
+@app.route("/api/ranking")
+def api_ranking():
+    start_date = request.args.get("start_date")
+    end_date = request.args.get("end_date")
+    date_str = request.args.get("date") or _default_date()
+    ranking = engine.get_full_ranking(date_str=date_str, start_date=start_date, end_date=end_date)
+    return jsonify({"materials": ranking, "total": len(ranking)})
+
+
+@app.route("/api/material/<material_id>")
+def api_material_detail(material_id: str):
+    start_date = request.args.get("start_date")
+    end_date = request.args.get("end_date")
+    conn = sqlite3.connect(_db_path())
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    if start_date and end_date:
+        c.execute(
+            "SELECT * FROM material_reports WHERE material_id = ? AND stat_date BETWEEN ? AND ? ORDER BY stat_date ASC",
+            (material_id, start_date, end_date),
+        )
+    else:
+        c.execute(
+            "SELECT * FROM material_reports WHERE material_id = ? ORDER BY stat_date ASC",
+            (material_id,),
+        )
+    rows = c.fetchall()
+    conn.close()
+    if not rows:
+        return jsonify({"error": "material not found"}), 404
+    daily = []
+    totals = {"cost": 0, "show": 0, "click": 0, "clue": 0, "consult": 0, "convert": 0}
+    for r in rows:
+        daily.append({
+            "date": r["stat_date"],
+            "cost": round(r["stat_cost"] or 0, 2),
+            "show": r["show_cnt"] or 0,
+            "click": r["click_cnt"] or 0,
+            "ctr": round(r["ctr"] or 0, 1),
+            "clue": r["clue_message_count"] or 0,
+            "consult": r["message_action_cnt"] or 0,
+            "convert": r["convert_cnt"] or 0,
+        })
+        totals["cost"] += r["stat_cost"] or 0
+        totals["show"] += r["show_cnt"] or 0
+        totals["click"] += r["click_cnt"] or 0
+        totals["clue"] += r["clue_message_count"] or 0
+        totals["consult"] += r["message_action_cnt"] or 0
+        totals["convert"] += r["convert_cnt"] or 0
+    first = rows[0]
+    return jsonify({
+        "material_id": first["material_id"],
+        "material_name": first["material_name"],
+        "material_type": first["material_type"],
+        "account_id": first["account_id"],
+        "daily": daily,
+        "totals": totals,
+    })
+
+
+@app.route("/api/material/<material_id>/creative")
+def api_material_creative(material_id: str):
+    conn = sqlite3.connect(_db_path())
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute(
+        "SELECT DISTINCT account_id FROM material_reports WHERE material_id = ? LIMIT 1",
+        (material_id,),
+    )
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"error": "material not found"}), 404
+    account_id = row["account_id"]
+    try:
+        from src.api.client import OceanEngineClient
+        client = OceanEngineClient()
+        today_str = _default_date()
+        from datetime import date as _date, timedelta as _td
+        start = (_date.today() - _td(days=7)).strftime("%Y-%m-%d")
+        promo_result = client._get("/local/report/promotion/get/", {
+            "local_account_id": int(account_id),
+            "start_date": start,
+            "end_date": today_str,
+            "page": 1, "page_size": 50,
+            "metrics": ["stat_cost"],
+        })
+        if promo_result.get("code") != 0:
+            return jsonify({"error": "promotion API failed"}), 502
+        promotions = promo_result.get("data", {}).get("promotion_list", [])
+        unique_pids = list(set(p.get("promotion_id") for p in promotions))
+        for pid in unique_pids:
+            detail = client._get("/local/promotion/detail/", {
+                "local_account_id": int(account_id),
+                "promotion_id": pid,
+            })
+            if detail.get("code") != 0:
+                continue
+            pm = detail.get("data", {}).get("procedural_material", {})
+            for key in ("video_material_list", "image_material_list", "title_material_list"):
+                for m in pm.get(key, []):
+                    if str(m.get("lego_material_id", "")) == str(material_id):
+                        return jsonify({
+                            "creative_material_id": str(m.get("material_id", "")),
+                            "video_id": m.get("video_id"),
+                            "image_id": m.get("image_id"),
+                            "material_type": key.split("_")[0],
+                            "promotion_id": pid,
+                        })
+        return jsonify({"error": "creative mapping not found"}), 404
+    except Exception as e:
+        logger.warning("Creative lookup failed for %s: %s", material_id, e)
+        return jsonify({"error": "lookup failed"}), 502
+
+
+@app.route("/api/projects/<account_id>")
+def api_projects(account_id: str):
+    try:
+        from src.api.client import OceanEngineClient
+        client = OceanEngineClient()
+        promotions = client.get_promotion_report(
+            account_id, _default_date(), _default_date(),
+        )
+        seen = set()
+        projects = []
+        for p in promotions:
+            cid = p.get("project_id", "")
+            if cid and cid not in seen:
+                seen.add(cid)
+                projects.append({
+                    "project_id": cid,
+                    "project_name": p.get("project_name", ""),
+                    "promotion_id": p.get("promotion_id", ""),
+                })
+        return jsonify({"projects": projects})
+    except Exception as e:
+        logger.warning("Failed to get projects for %s: %s", account_id, e)
+        return jsonify({"projects": []})
+
+
+@app.route("/api/sync/status")
+def api_sync_status():
+    return jsonify(sync_status.to_dict())
+
+
+@app.route("/api/sync/trigger", methods=["POST"])
+def api_sync_trigger():
+    if sync_status.is_syncing:
+        return jsonify({"ok": False, "message": "同步正在进行中，请稍后…"}), 409
+    if _scheduler is None:
+        return jsonify({"ok": False, "message": "调度器未初始化"}), 500
+    _scheduler.trigger_now()
+    return jsonify({"ok": True, "message": "同步已触发，稍后刷新数据"})
+
+
+@app.route("/api/sync/backfill", methods=["POST"])
+def api_sync_backfill():
+    if sync_status.is_syncing:
+        return jsonify({"ok": False, "message": "同步正在进行中，请稍后…"}), 409
+    if _scheduler is None:
+        return jsonify({"ok": False, "message": "调度器未初始化"}), 500
+    days = int(request.args.get("days", 30))
+    _scheduler.trigger_backfill(days=days)
+    return jsonify({"ok": True, "message": f"已触发 {days} 天历史数据回填，正在后台执行…"})
+
+
+# ── Account Cockpit Routes ───────────────────────────────────────
+
+@app.route("/api/ad/overview")
+def api_ad_overview():
+    """
+    Account cockpit: global KPIs + per-account summary.
+    ?start_date=&end_date=  (default: latest 7 days)
+    """
+    end = request.args.get("end_date") or _default_date()
+    start = request.args.get("start_date") or (
+        date.fromisoformat(end) - timedelta(days=6)
+    ).strftime("%Y-%m-%d")
+
+    name_map = _get_account_name_map()
+    conn = sqlite3.connect(_db_path())
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+
+    # Global KPIs
+    c.execute("""
+        SELECT
+            SUM(stat_cost)           AS cost,
+            SUM(show_cnt)            AS show,
+            SUM(click_cnt)           AS click,
+            SUM(clue_message_count)  AS clue,
+            SUM(message_action_cnt)  AS consult,
+            SUM(convert_cnt)         AS convert,
+            AVG(ctr)                 AS avg_ctr,
+            AVG(cpm)                 AS avg_cpm,
+            COUNT(DISTINCT account_id) AS active_accounts
+        FROM account_reports
+        WHERE stat_date BETWEEN ? AND ?
+    """, (start, end))
+    g = dict(conn.execute("""
+        SELECT
+            SUM(stat_cost) AS cost,
+            SUM(show_cnt) AS show,
+            SUM(click_cnt) AS click,
+            SUM(clue_message_count) AS clue,
+            SUM(message_action_cnt) AS consult,
+            SUM(convert_cnt) AS convert,
+            COUNT(DISTINCT account_id) AS active_accounts,
+            COUNT(DISTINCT stat_date) AS days
+        FROM account_reports
+        WHERE stat_date BETWEEN ? AND ?
+          AND delivery_type = 'total'
+    """, (start, end)).fetchone())
+
+    total_cost = g["cost"] or 0
+    total_clue = g["clue"] or 0
+    total_consult = g["consult"] or 0
+    g["cpa_clue"] = round(total_cost / total_clue, 2) if total_clue else 0
+    g["cpa_consult"] = round(total_cost / total_consult, 2) if total_consult else 0
+    g["ctr"] = round(
+        (g["click"] or 0) / (g["show"] or 1) * 100, 2
+    )
+
+    # Per-account summary
+    rows = c.execute("""
+        SELECT
+            account_id,
+            SUM(stat_cost)           AS cost,
+            SUM(show_cnt)            AS show,
+            SUM(click_cnt)           AS click,
+            SUM(clue_message_count)  AS clue,
+            SUM(message_action_cnt)  AS consult,
+            SUM(convert_cnt)         AS convert,
+            AVG(cpm)                 AS avg_cpm,
+            COUNT(DISTINCT stat_date) AS active_days
+        FROM account_reports
+        WHERE stat_date BETWEEN ? AND ?
+          AND delivery_type = 'total'
+        GROUP BY account_id
+        ORDER BY cost DESC
+    """, (start, end)).fetchall()
+
+    accounts = []
+    for r in rows:
+        cost = r["cost"] or 0
+        clue = r["clue"] or 0
+        consult = r["consult"] or 0
+        ctr = round((r["click"] or 0) / (r["show"] or 1) * 100, 2)
+        accounts.append({
+            "account_id": r["account_id"],
+            "account_name": name_map.get(r["account_id"], r["account_id"][-8:]),
+            "cost": round(cost, 2),
+            "show": r["show"] or 0,
+            "click": r["click"] or 0,
+            "clue": clue,
+            "consult": consult,
+            "convert": r["convert"] or 0,
+            "ctr": ctr,
+            "avg_cpm": round(r["avg_cpm"] or 0, 2),
+            "cpa_clue": round(cost / clue, 2) if clue else 0,
+            "cpa_consult": round(cost / consult, 2) if consult else 0,
+            "active_days": r["active_days"] or 0,
+            "cost_share": round(cost / total_cost * 100, 1) if total_cost else 0,
+        })
+
+    conn.close()
+    return jsonify({
+        "start": start, "end": end,
+        "global": g,
+        "accounts": accounts,
+    })
+
+
+@app.route("/api/ad/trend")
+def api_ad_trend():
+    """
+    Daily trend for all accounts (or a single account).
+    ?start_date=&end_date=&account_id=
+    """
+    end = request.args.get("end_date") or _default_date()
+    start = request.args.get("start_date") or (
+        date.fromisoformat(end) - timedelta(days=13)
+    ).strftime("%Y-%m-%d")
+    account_id = request.args.get("account_id", "")
+
+    name_map = _get_account_name_map()
+    conn = sqlite3.connect(_db_path())
+    conn.row_factory = sqlite3.Row
+
+    if account_id:
+        rows = conn.execute("""
+            SELECT stat_date, account_id,
+                   stat_cost AS cost, show_cnt AS show, click_cnt AS click,
+                   clue_message_count AS clue, message_action_cnt AS consult,
+                   convert_cnt AS convert, ctr, cpm
+            FROM account_reports
+            WHERE stat_date BETWEEN ? AND ? AND account_id = ?
+              AND delivery_type = 'total'
+            ORDER BY stat_date
+        """, (start, end, account_id)).fetchall()
+    else:
+        rows = conn.execute("""
+            SELECT stat_date,
+                   SUM(stat_cost)           AS cost,
+                   SUM(show_cnt)            AS show,
+                   SUM(click_cnt)           AS click,
+                   SUM(clue_message_count)  AS clue,
+                   SUM(message_action_cnt)  AS consult,
+                   SUM(convert_cnt)         AS convert,
+                   AVG(ctr)                 AS ctr,
+                   AVG(cpm)                 AS cpm
+            FROM account_reports
+            WHERE stat_date BETWEEN ? AND ?
+              AND delivery_type = 'total'
+            GROUP BY stat_date
+            ORDER BY stat_date
+        """, (start, end)).fetchall()
+
+    # Also get per-account daily (for stacked chart)
+    acc_rows = conn.execute("""
+        SELECT stat_date, account_id,
+               SUM(stat_cost) AS cost,
+               SUM(clue_message_count) AS clue
+        FROM account_reports
+        WHERE stat_date BETWEEN ? AND ?
+          AND delivery_type = 'total'
+        GROUP BY stat_date, account_id
+        ORDER BY stat_date, cost DESC
+    """, (start, end)).fetchall()
+    conn.close()
+
+    trend = [
+        {
+            "date": r["stat_date"],
+            "cost": round(r["cost"] or 0, 2),
+            "show": r["show"] or 0,
+            "click": r["click"] or 0,
+            "clue": r["clue"] or 0,
+            "consult": r["consult"] or 0,
+            "convert": r["convert"] or 0,
+            "ctr": round(r["ctr"] or 0, 2),
+            "cpm": round(r["cpm"] or 0, 2),
+        }
+        for r in rows
+    ]
+
+    # Build stacked series: {account_id: [{date, cost}, ...]}
+    stacked: dict = {}
+    for r in acc_rows:
+        aid = r["account_id"]
+        if aid not in stacked:
+            stacked[aid] = {"name": name_map.get(aid, aid[-8:]), "data": []}
+        stacked[aid]["data"].append({
+            "date": r["stat_date"],
+            "cost": round(r["cost"] or 0, 2),
+            "clue": r["clue"] or 0,
+        })
+
+    return jsonify({"trend": trend, "stacked": list(stacked.values())})
+
+
+@app.route("/api/ad/projects")
+def api_ad_projects():
+    """
+    Project-level analysis from promotion_reports.
+    ?start_date=&end_date=&account_id=
+    """
+    end = request.args.get("end_date") or _default_date()
+    start = request.args.get("start_date") or (
+        date.fromisoformat(end) - timedelta(days=6)
+    ).strftime("%Y-%m-%d")
+    account_id = request.args.get("account_id", "")
+
+    name_map = _get_account_name_map()
+    conn = sqlite3.connect(_db_path())
+    conn.row_factory = sqlite3.Row
+
+    where = "WHERE stat_date BETWEEN ? AND ?"
+    params: list = [start, end]
+    if account_id:
+        where += " AND account_id = ?"
+        params.append(account_id)
+
+    rows = conn.execute(f"""
+        SELECT
+            project_id,
+            project_name,
+            account_id,
+            SUM(stat_cost)           AS cost,
+            SUM(show_cnt)            AS show,
+            SUM(click_cnt)           AS click,
+            SUM(clue_message_count)  AS clue,
+            SUM(message_action_cnt)  AS consult,
+            SUM(convert_cnt)         AS convert,
+            COUNT(DISTINCT promotion_id) AS promo_count,
+            COUNT(DISTINCT stat_date)    AS active_days
+        FROM promotion_reports
+        {where}
+        GROUP BY project_id, account_id
+        ORDER BY cost DESC
+    """, params).fetchall()
+    conn.close()
+
+    projects = []
+    for r in rows:
+        cost = r["cost"] or 0
+        clue = r["clue"] or 0
+        consult = r["consult"] or 0
+        ctr = round((r["click"] or 0) / (r["show"] or 1) * 100, 2)
+        projects.append({
+            "project_id": r["project_id"],
+            "project_name": r["project_name"] or r["project_id"],
+            "account_id": r["account_id"],
+            "account_name": name_map.get(r["account_id"], r["account_id"][-8:]),
+            "cost": round(cost, 2),
+            "show": r["show"] or 0,
+            "click": r["click"] or 0,
+            "clue": clue,
+            "consult": consult,
+            "convert": r["convert"] or 0,
+            "ctr": ctr,
+            "cpa_clue": round(cost / clue, 2) if clue else 0,
+            "cpa_consult": round(cost / consult, 2) if consult else 0,
+            "promo_count": r["promo_count"] or 0,
+            "active_days": r["active_days"] or 0,
+        })
+
+    return jsonify({"projects": projects, "start": start, "end": end})
+
+
+@app.route("/api/ad/promotions")
+def api_ad_promotions():
+    """
+    Promotion-unit level ranking.
+    ?start_date=&end_date=&account_id=&project_id=&limit=50
+    """
+    end = request.args.get("end_date") or _default_date()
+    start = request.args.get("start_date") or (
+        date.fromisoformat(end) - timedelta(days=6)
+    ).strftime("%Y-%m-%d")
+    account_id = request.args.get("account_id", "")
+    project_id = request.args.get("project_id", "")
+    limit = int(request.args.get("limit", 50))
+
+    name_map = _get_account_name_map()
+    conn = sqlite3.connect(_db_path())
+    conn.row_factory = sqlite3.Row
+
+    where = "WHERE stat_date BETWEEN ? AND ?"
+    params: list = [start, end]
+    if account_id:
+        where += " AND account_id = ?"
+        params.append(account_id)
+    if project_id:
+        where += " AND project_id = ?"
+        params.append(project_id)
+
+    rows = conn.execute(f"""
+        SELECT
+            promotion_id,
+            promotion_name,
+            promotion_status,
+            project_id,
+            project_name,
+            account_id,
+            SUM(stat_cost)           AS cost,
+            SUM(show_cnt)            AS show,
+            SUM(click_cnt)           AS click,
+            SUM(clue_message_count)  AS clue,
+            SUM(message_action_cnt)  AS consult,
+            SUM(convert_cnt)         AS convert,
+            COUNT(DISTINCT stat_date) AS active_days
+        FROM promotion_reports
+        {where}
+        GROUP BY promotion_id
+        ORDER BY cost DESC
+        LIMIT ?
+    """, params + [limit]).fetchall()
+    conn.close()
+
+    promos = []
+    for r in rows:
+        cost = r["cost"] or 0
+        clue = r["clue"] or 0
+        consult = r["consult"] or 0
+        ctr = round((r["click"] or 0) / (r["show"] or 1) * 100, 2)
+        promos.append({
+            "promotion_id": r["promotion_id"],
+            "promotion_name": r["promotion_name"] or r["promotion_id"],
+            "promotion_status": r["promotion_status"] or "",
+            "project_id": r["project_id"],
+            "project_name": r["project_name"] or "",
+            "account_id": r["account_id"],
+            "account_name": name_map.get(r["account_id"], r["account_id"][-8:]),
+            "cost": round(cost, 2),
+            "show": r["show"] or 0,
+            "click": r["click"] or 0,
+            "clue": clue,
+            "consult": consult,
+            "convert": r["convert"] or 0,
+            "ctr": ctr,
+            "cpa_clue": round(cost / clue, 2) if clue else 0,
+            "cpa_consult": round(cost / consult, 2) if consult else 0,
+            "active_days": r["active_days"] or 0,
+        })
+
+    return jsonify({"promotions": promos, "start": start, "end": end})
+
+
+# ── Account Report Routes (单账户综合报告) ─────────────────────
+
+@app.route("/api/account_report/<account_id>")
+def api_account_report(account_id: str):
+    """
+    单个账户的综合报告：KPI、每日趋势、项目排行、单元排行、素材排行。
+    ?start_date=&end_date=
+    """
+    end = request.args.get("end_date") or _default_date()
+    start = request.args.get("start_date") or (
+        date.fromisoformat(end) - timedelta(days=6)
+    ).strftime("%Y-%m-%d")
+
+    name_map = _get_account_name_map()
+    account_name = name_map.get(account_id, account_id[-8:])
+    conn = sqlite3.connect(_db_path())
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+
+    # ── Account KPIs ──
+    acc_row = c.execute("""
+        SELECT
+            SUM(stat_cost)           AS cost,
+            SUM(show_cnt)            AS show,
+            SUM(click_cnt)           AS click,
+            SUM(clue_message_count)  AS clue,
+            SUM(message_action_cnt)  AS consult,
+            SUM(convert_cnt)         AS convert,
+            COUNT(DISTINCT stat_date) AS active_days
+        FROM account_reports
+        WHERE account_id = ? AND stat_date BETWEEN ? AND ?
+          AND delivery_type = 'total'
+    """, (account_id, start, end)).fetchone()
+
+    cost = acc_row["cost"] or 0
+    clue = acc_row["clue"] or 0
+    consult = acc_row["consult"] or 0
+    show_val = acc_row["show"] or 0
+    click_val = acc_row["click"] or 0
+
+    kpi = {
+        "account_id": account_id,
+        "account_name": account_name,
+        "cost": round(cost, 2),
+        "show": show_val,
+        "click": click_val,
+        "clue": clue,
+        "consult": consult,
+        "convert": acc_row["convert"] or 0,
+        "ctr": round(click_val / (show_val or 1) * 100, 2),
+        "cpm": round(cost / (show_val or 1) * 1000, 2),
+        "lead_cost": round(cost / clue, 2) if clue else 0,
+        "consult_cost": round(cost / consult, 2) if consult else 0,
+        "lead_rate": round(clue / (consult or 1) * 100, 1),
+        "active_days": acc_row["active_days"] or 0,
+    }
+
+    # ── Daily trend ──
+    trend_rows = c.execute("""
+        SELECT stat_date,
+               stat_cost AS cost, show_cnt AS show, click_cnt AS click,
+               clue_message_count AS clue, message_action_cnt AS consult,
+               convert_cnt AS convert, ctr
+        FROM account_reports
+        WHERE account_id = ? AND stat_date BETWEEN ? AND ?
+          AND delivery_type = 'total'
+        ORDER BY stat_date
+    """, (account_id, start, end)).fetchall()
+
+    trend = [
+        {
+            "date": r["stat_date"],
+            "cost": round(r["cost"] or 0, 2),
+            "show": r["show"] or 0,
+            "click": r["click"] or 0,
+            "clue": r["clue"] or 0,
+            "consult": r["consult"] or 0,
+            "convert": r["convert"] or 0,
+            "ctr": round(r["ctr"] or 0, 2),
+        }
+        for r in trend_rows
+    ]
+
+    # [DEPRECATED 2026-06-28] 通投/搜索拆分已废弃（按 SKILL.md 规范）
+    # API 默认返回通投+搜索全量，不再做拆分展示。
+    delivery_split = {}
+
+    # ── Projects ──
+    proj_rows = c.execute("""
+        SELECT
+            project_id, project_name,
+            SUM(stat_cost)           AS cost,
+            SUM(show_cnt)            AS show,
+            SUM(click_cnt)           AS click,
+            SUM(clue_message_count)  AS clue,
+            SUM(message_action_cnt)  AS consult,
+            SUM(convert_cnt)         AS convert,
+            COUNT(DISTINCT promotion_id) AS promo_count,
+            COUNT(DISTINCT stat_date)    AS active_days
+        FROM promotion_reports
+        WHERE account_id = ? AND stat_date BETWEEN ? AND ?
+        GROUP BY project_id
+        ORDER BY cost DESC
+    """, (account_id, start, end)).fetchall()
+
+    projects = []
+    for r in proj_rows:
+        pc = r["cost"] or 0
+        pl = r["clue"] or 0
+        projects.append({
+            "project_id": r["project_id"],
+            "project_name": r["project_name"] or r["project_id"],
+            "cost": round(pc, 2),
+            "show": r["show"] or 0,
+            "click": r["click"] or 0,
+            "clue": pl,
+            "consult": r["consult"] or 0,
+            "convert": r["convert"] or 0,
+            "ctr": round((r["click"] or 0) / (r["show"] or 1) * 100, 2),
+            "lead_cost": round(pc / pl, 2) if pl else 0,
+            "promo_count": r["promo_count"] or 0,
+            "active_days": r["active_days"] or 0,
+        })
+
+    # ── Promotions (top 30) ──
+    promo_rows = c.execute("""
+        SELECT
+            promotion_id, promotion_name, promotion_status,
+            project_id, project_name,
+            SUM(stat_cost)           AS cost,
+            SUM(show_cnt)            AS show,
+            SUM(click_cnt)           AS click,
+            SUM(clue_message_count)  AS clue,
+            SUM(message_action_cnt)  AS consult,
+            SUM(convert_cnt)         AS convert,
+            COUNT(DISTINCT stat_date) AS active_days
+        FROM promotion_reports
+        WHERE account_id = ? AND stat_date BETWEEN ? AND ?
+        GROUP BY promotion_id
+        ORDER BY cost DESC
+        LIMIT 30
+    """, (account_id, start, end)).fetchall()
+
+    promotions = []
+    for r in promo_rows:
+        prc = r["cost"] or 0
+        prl = r["clue"] or 0
+        promotions.append({
+            "promotion_id": r["promotion_id"],
+            "promotion_name": r["promotion_name"] or r["promotion_id"],
+            "status": r["promotion_status"] or "",
+            "project_name": r["project_name"] or r["project_id"],
+            "cost": round(prc, 2),
+            "show": r["show"] or 0,
+            "click": r["click"] or 0,
+            "clue": prl,
+            "consult": r["consult"] or 0,
+            "convert": r["convert"] or 0,
+            "ctr": round((r["click"] or 0) / (r["show"] or 1) * 100, 2),
+            "lead_cost": round(prc / prl, 2) if prl else 0,
+            "active_days": r["active_days"] or 0,
+        })
+
+    # ── Materials (top 30) ──
+    mat_rows = c.execute("""
+        SELECT
+            material_id, material_name, material_type,
+            SUM(stat_cost)           AS cost,
+            SUM(show_cnt)            AS show,
+            SUM(click_cnt)           AS click,
+            SUM(clue_message_count)  AS clue,
+            SUM(message_action_cnt)  AS consult,
+            SUM(convert_cnt)         AS convert,
+            COUNT(DISTINCT stat_date) AS active_days
+        FROM material_reports
+        WHERE account_id = ? AND stat_date BETWEEN ? AND ?
+        GROUP BY material_id
+        ORDER BY cost DESC
+        LIMIT 30
+    """, (account_id, start, end)).fetchall()
+
+    materials = []
+    for r in mat_rows:
+        mc = r["cost"] or 0
+        ml = r["clue"] or 0
+        mcons = r["consult"] or 0
+        materials.append({
+            "material_id": r["material_id"],
+            "material_name": r["material_name"] or r["material_id"],
+            "material_type": r["material_type"] or "",
+            "cost": round(mc, 2),
+            "show": r["show"] or 0,
+            "click": r["click"] or 0,
+            "clue": ml,
+            "consult": mcons,
+            "convert": r["convert"] or 0,
+            "ctr": round((r["click"] or 0) / (r["show"] or 1) * 100, 2),
+            "lead_cost": round(mc / ml, 2) if ml else 0,
+            "lead_rate": round(ml / (mcons or 1) * 100, 1),
+            "active_days": r["active_days"] or 0,
+        })
+
+    conn.close()
+    return jsonify({
+        "start": start, "end": end,
+        "kpi": kpi,
+        "trend": trend,
+        "delivery_split": delivery_split,
+        "projects": projects,
+        "promotions": promotions,
+        "materials": materials,
+    })
+
+
+@app.route("/api/account_report/<account_id>/export")
+def api_account_report_export(account_id: str):
+    """
+    导出单个账户报告为 Word 文档。
+    ?start_date=&end_date=
+    """
+    from docx import Document
+    from docx.shared import Pt, Cm
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.enum.table import WD_TABLE_ALIGNMENT
+    from docx.oxml.ns import qn
+    from io import BytesIO
+
+    end = request.args.get("end_date") or _default_date()
+    start = request.args.get("start_date") or (
+        date.fromisoformat(end) - timedelta(days=6)
+    ).strftime("%Y-%m-%d")
+
+    name_map = _get_account_name_map()
+    account_name = name_map.get(account_id, account_id[-8:])
+    conn = sqlite3.connect(_db_path())
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+
+    # KPIs
+    acc_row = c.execute("""
+        SELECT SUM(stat_cost) AS cost, SUM(show_cnt) AS show, SUM(click_cnt) AS click,
+               SUM(clue_message_count) AS clue, SUM(message_action_cnt) AS consult,
+               SUM(convert_cnt) AS convert, COUNT(DISTINCT stat_date) AS active_days
+        FROM account_reports
+        WHERE account_id = ? AND stat_date BETWEEN ? AND ?
+          AND delivery_type = 'total'
+    """, (account_id, start, end)).fetchone()
+
+    cost = acc_row["cost"] or 0
+    clue = acc_row["clue"] or 0
+    consult = acc_row["consult"] or 0
+    show_val = acc_row["show"] or 0
+    click_val = acc_row["click"] or 0
+    convert_val = acc_row["convert"] or 0
+
+    # [DEPRECATED 2026-06-28] Delivery type split removed (按 SKILL.md 规范)
+    delivery_data = {}
+
+    # Projects
+    proj_rows = c.execute("""
+        SELECT project_id, project_name,
+               SUM(stat_cost) AS cost, SUM(clue_message_count) AS clue,
+               SUM(message_action_cnt) AS consult, SUM(convert_cnt) AS convert,
+               COUNT(DISTINCT promotion_id) AS promo_count
+        FROM promotion_reports
+        WHERE account_id = ? AND stat_date BETWEEN ? AND ?
+        GROUP BY project_id ORDER BY cost DESC
+    """, (account_id, start, end)).fetchall()
+
+    # Promotions
+    promo_rows = c.execute("""
+        SELECT promotion_id, promotion_name, project_name,
+               SUM(stat_cost) AS cost, SUM(clue_message_count) AS clue,
+               SUM(convert_cnt) AS convert, SUM(show_cnt) AS show, SUM(click_cnt) AS click
+        FROM promotion_reports
+        WHERE account_id = ? AND stat_date BETWEEN ? AND ?
+        GROUP BY promotion_id ORDER BY cost DESC LIMIT 30
+    """, (account_id, start, end)).fetchall()
+
+    # Materials
+    mat_rows = c.execute("""
+        SELECT material_id, material_name, material_type,
+               SUM(stat_cost) AS cost, SUM(clue_message_count) AS clue,
+               SUM(message_action_cnt) AS consult, SUM(convert_cnt) AS convert,
+               SUM(show_cnt) AS show, SUM(click_cnt) AS click
+        FROM material_reports
+        WHERE account_id = ? AND stat_date BETWEEN ? AND ?
+        GROUP BY material_id ORDER BY cost DESC LIMIT 30
+    """, (account_id, start, end)).fetchall()
+
+    conn.close()
+
+    # ── Build Word Document ──
+    doc = Document()
+
+    style = doc.styles['Normal']
+    font = style.font
+    font.name = '微软雅黑'
+    font.size = Pt(10)
+    style.element.rPr.rFonts.set(qn('w:eastAsia'), '微软雅黑')
+
+    for section in doc.sections:
+        section.top_margin = Cm(1.5)
+        section.bottom_margin = Cm(1.5)
+        section.left_margin = Cm(2)
+        section.right_margin = Cm(2)
+
+    title = doc.add_heading(f'投流账户报告 — {account_name}', level=0)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    meta = doc.add_paragraph()
+    meta.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    meta.add_run(f'数据周期：{start} ~ {end}    |    账户ID：{account_id}').font.size = Pt(9)
+
+    doc.add_paragraph()
+
+    # Section 1: KPI
+    doc.add_heading('一、核心指标概览', level=1)
+
+    kpi_data = [
+        ("总消耗", f"¥{cost:,.0f}"),
+        ("总展示", f"{show_val:,}"),
+        ("总点击", f"{click_val:,}"),
+        ("CTR", f"{click_val / (show_val or 1) * 100:.2f}%"),
+        ("总线索(留资)", f"{clue:,}"),
+        ("总咨询", f"{consult:,}"),
+        ("总转化", f"{acc_row['convert'] or 0:,}"),
+        ("转化成本(留资)", f"¥{cost / clue:.0f}" if clue else "--"),
+        ("咨询成本", f"¥{cost / consult:.0f}" if consult else "--"),
+        ("留资率", f"{clue / (consult or 1) * 100:.1f}%"),
+        ("活跃天数", f"{acc_row['active_days'] or 0}天"),
+    ]
+
+    kt = doc.add_table(rows=1, cols=4)
+    kt.alignment = WD_TABLE_ALIGNMENT.CENTER
+    kt.style = 'Light Grid Accent 1'
+    for i, (label, value) in enumerate(kpi_data):
+        row_idx = i // 2
+        col_idx = (i % 2) * 2
+        if row_idx >= len(kt.rows):
+            kt.add_row()
+        row = kt.rows[row_idx]
+        row.cells[col_idx].text = label
+        row.cells[col_idx + 1].text = value
+
+    doc.add_paragraph()
+
+    # [DEPRECATED 2026-06-28] 投放类型拆分章节已废弃（按 SKILL.md 规范）
+
+    # Section 2: Projects
+    doc.add_heading('二、项目排行', level=1)
+    if proj_rows:
+        pt = doc.add_table(rows=1, cols=6)
+        pt.style = 'Light Grid Accent 1'
+        pt.alignment = WD_TABLE_ALIGNMENT.CENTER
+        for i, h in enumerate(["项目名称", "消耗", "线索", "咨询", "转化", "投放单元数"]):
+            pt.rows[0].cells[i].text = h
+        for r in proj_rows:
+            row = pt.add_row()
+            row.cells[0].text = r["project_name"] or r["project_id"]
+            row.cells[1].text = f'¥{r["cost"]:,.0f}' if r["cost"] else "0"
+            row.cells[2].text = str(r["clue"] or 0)
+            row.cells[3].text = str(r["consult"] or 0)
+            row.cells[4].text = str(r["convert"] or 0)
+            row.cells[5].text = str(r["promo_count"] or 0)
+    else:
+        doc.add_paragraph("（无项目数据）")
+
+    doc.add_paragraph()
+
+    # Section 3: Promotions
+    doc.add_heading('三、投放单元排行 (TOP 20)', level=1)
+    if promo_rows:
+        prt = doc.add_table(rows=1, cols=8)
+        prt.style = 'Light Grid Accent 1'
+        prt.alignment = WD_TABLE_ALIGNMENT.CENTER
+        for i, h in enumerate(["单元名称", "所属项目", "消耗", "展示", "点击", "线索", "转化", "转化成本"]):
+            prt.rows[0].cells[i].text = h
+        for r in promo_rows[:20]:
+            row = prt.add_row()
+            row.cells[0].text = (r["promotion_name"] or r["promotion_id"])[:30]
+            row.cells[1].text = (r["project_name"] or "")[:20]
+            row.cells[2].text = f'¥{r["cost"]:,.0f}' if r["cost"] else "0"
+            row.cells[3].text = str(r["show"] or 0)
+            row.cells[4].text = str(r["click"] or 0)
+            prl_val = r["clue"] or 0
+            row.cells[5].text = str(prl_val)
+            row.cells[6].text = str(r["convert"] or 0)
+            row.cells[7].text = f'¥{r["cost"] / prl_val:.0f}' if prl_val and r["cost"] else "--"
+    else:
+        doc.add_paragraph("（无投放单元数据）")
+
+    doc.add_paragraph()
+
+    # Section 4: Materials
+    doc.add_heading('四、素材排行 (TOP 20)', level=1)
+    if mat_rows:
+        mt = doc.add_table(rows=1, cols=8)
+        mt.style = 'Light Grid Accent 1'
+        mt.alignment = WD_TABLE_ALIGNMENT.CENTER
+        for i, h in enumerate(["素材名称", "类型", "消耗", "展示", "点击", "线索", "留资率", "转化成本"]):
+            mt.rows[0].cells[i].text = h
+        for r in mat_rows[:20]:
+            row = mt.add_row()
+            row.cells[0].text = (r["material_name"] or r["material_id"])[:30]
+            row.cells[1].text = r["material_type"] or ""
+            row.cells[2].text = f'¥{r["cost"]:,.0f}' if r["cost"] else "0"
+            row.cells[3].text = str(r["show"] or 0)
+            row.cells[4].text = str(r["click"] or 0)
+            mv_cost = r["cost"] or 0
+            mv_clue = r["clue"] or 0
+            mv_consult = r["consult"] or 0
+            row.cells[5].text = str(mv_clue)
+            row.cells[6].text = f'{mv_clue / (mv_consult or 1) * 100:.1f}%'
+            row.cells[7].text = f'¥{mv_cost / mv_clue:.0f}' if mv_clue else "--"
+
+    doc.add_paragraph()
+    footer = doc.add_paragraph()
+    footer.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    footer.add_run(f'报告生成时间：{date.today().strftime("%Y-%m-%d")}').font.size = Pt(8)
+
+    buf = BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+
+    filename = f'{account_name}_投流报告_{start}_{end}.docx'
+    return send_file(
+        buf,
+        mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        as_attachment=True,
+        download_name=filename,
+    )
+
+
+# ── Radar / Quality Diagnosis Routes ─────────────────────────────
+
+@app.route("/api/radar/accounts")
+def api_radar_accounts():
+    """投手诊断：账户级质量雷达"""
+    days = int(request.args.get("days", 7))
+    start_date = request.args.get("start_date")
+    end_date = request.args.get("end_date")
+    return jsonify(radar.accounts(days, start_date=start_date, end_date=end_date))
+
+
+@app.route("/api/radar/promotions/<account_id>")
+def api_radar_promotions(account_id):
+    """投手诊断：指定账户的项目/广告级诊断"""
+    days = int(request.args.get("days", 7))
+    return jsonify(radar.promotions(account_id, days))
+
+
+@app.route("/api/radar/materials/<account_id>")
+def api_radar_materials(account_id):
+    """投手诊断：指定账户的素材级诊断"""
+    days = int(request.args.get("days", 7))
+    return jsonify(radar.materials(account_id, days))
+
+
+@app.route("/api/radar/battle")
+def api_radar_battle():
+    """每日作战清单：放量/降量/疲劳/陷阱/排查 五张表"""
+    days = int(request.args.get("days", 7))
+    start_date = request.args.get("start_date")
+    end_date = request.args.get("end_date")
+    return jsonify(radar.battle_list(days, start_date=start_date, end_date=end_date))
+
+
+# ── Start ────────────────────────────────────────────────────────
+
+def start_dashboard(port: int = 8888, debug: bool = False):
+    logger.info("Starting dual cockpit on http://localhost:%d", port)
+    import os as _os
+    if not debug or _os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+        _start_scheduler()
+    app.run(host="0.0.0.0", port=port, debug=debug)
+
+
+# ============================================================
+# DASHBOARD HTML — v3 Dual Cockpit
+# ============================================================
+
+DASHBOARD_HTML = r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>投流数据驾驶舱</title>
+<script src="/static/echarts.min.js"></script>
+<style>
+:root {
+  --bg: #060918;
+  --panel: rgba(10,15,41,0.9);
+  --card: rgba(14,20,52,0.92);
+  --border: rgba(0,180,255,0.1);
+  --border-active: rgba(0,200,255,0.3);
+  --cyan: #00d4ff;
+  --purple: #a78bfa;
+  --amber: #f59e0b;
+  --emerald: #10b981;
+  --rose: #f43f5e;
+  --text: #e2e8f0;
+  --text2: #94a3b8;
+  --text3: #64748b;
+  --radius: 12px;
+}
+* { box-sizing:border-box; margin:0; padding:0; }
+body {
+  font-family: -apple-system,'PingFang SC','Microsoft YaHei',sans-serif;
+  font-size:14px; color:var(--text); background:var(--bg); min-height:100vh;
+  -webkit-font-smoothing:antialiased;
+}
+body::before {
+  content:''; position:fixed; inset:0; pointer-events:none; z-index:0;
+  background:radial-gradient(ellipse 80% 60% at 50% 10%, rgba(0,150,255,.05) 0%, transparent 70%),
+    radial-gradient(ellipse 60% 50% at 85% 80%, rgba(139,92,246,.03) 0%, transparent 70%);
+}
+
+/* ── Top Header ── */
+.header {
+  position:relative; z-index:10;
+  padding:12px 20px;
+  display:flex; align-items:center; justify-content:space-between;
+  border-bottom:1px solid var(--border);
+  background:linear-gradient(180deg,rgba(10,15,41,.98),rgba(10,15,41,.75));
+  backdrop-filter:blur(12px);
+}
+.header-left { display:flex; align-items:center; gap:10px; }
+.header h1 { font-size:16px; font-weight:600; color:var(--cyan); letter-spacing:.5px; }
+.header-right { display:flex; align-items:center; gap:10px; font-size:12px; color:var(--text3); flex-wrap:wrap; }
+.sync-btn {
+  padding:3px 12px; border-radius:5px; border:1px solid rgba(255,255,255,.12);
+  background:rgba(255,255,255,.06); color:var(--text2); font-size:11px; cursor:pointer;
+}
+.sync-btn:hover { border-color:var(--cyan); color:var(--cyan); }
+.sync-btn.amber { border-color:rgba(245,158,11,.4); color:var(--amber); background:rgba(245,158,11,.08); }
+
+/* ── Cockpit Switcher ── */
+.cockpit-bar {
+  display:flex; gap:0; z-index:10; position:relative;
+  background:rgba(6,9,24,.95); border-bottom:1px solid var(--border);
+  padding:0 20px;
+}
+.cockpit-btn {
+  padding:12px 28px; border:none; background:transparent;
+  color:var(--text3); font-size:14px; font-weight:500; cursor:pointer;
+  border-bottom:2px solid transparent; transition:all .2s; white-space:nowrap;
+}
+.cockpit-btn:hover { color:var(--text2); }
+.cockpit-btn.active { color:var(--cyan); border-bottom-color:var(--cyan); }
+
+/* ── Sub-Tab Bar ── */
+.tab-bar {
+  display:flex; gap:4px; padding:10px 20px 0; position:relative; z-index:10;
+  overflow-x:auto; background:var(--panel); border-bottom:1px solid var(--border);
+}
+.tab-btn {
+  padding:7px 16px; border-radius:8px 8px 0 0; border:none;
+  background:transparent; color:var(--text3); font-size:13px; cursor:pointer;
+  white-space:nowrap; transition:all .2s;
+}
+.tab-btn:hover { color:var(--text2); background:rgba(255,255,255,.03); }
+.tab-btn.active { color:var(--cyan); background:var(--card); }
+.tab-badge {
+  display:inline-block; padding:1px 6px; border-radius:8px;
+  font-size:10px; margin-left:4px; background:rgba(0,212,255,.12); color:var(--cyan);
+}
+
+/* ── Date Bar ── */
+.date-bar {
+  display:flex; align-items:center; gap:8px; flex-wrap:wrap;
+  padding:7px 20px; background:var(--panel); border-bottom:1px solid var(--border);
+  font-size:12px; color:var(--text2); position:relative; z-index:10;
+}
+.date-bar label { display:flex; align-items:center; gap:4px; }
+.date-bar input[type="date"] {
+  background:rgba(255,255,255,.06); border:1px solid var(--border);
+  border-radius:4px; color:var(--text); font-size:12px; padding:3px 7px;
+}
+.dq-btn {
+  padding:4px 12px; border-radius:5px; border:1px solid var(--border);
+  background:transparent; color:var(--text2); font-size:11px; cursor:pointer; transition:all .15s;
+}
+.dq-btn:hover { border-color:var(--cyan); color:var(--cyan); }
+.dq-btn.primary { background:var(--cyan); color:#060918; border-color:var(--cyan); font-weight:600; }
+.dq-btn.primary:hover { background:#00b8e0; }
+
+/* ── Main Content ── */
+.cockpit-content { display:none; }
+.cockpit-content.active { display:block; }
+.tab-content { display:none; }
+.tab-content.active { display:block; }
+.container { max-width:1400px; margin:0 auto; padding:14px 20px; position:relative; z-index:10; }
+
+/* ── KPI Cards ── */
+.kpi-row { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:10px; margin-bottom:14px; }
+.kpi-card {
+  background:var(--card); border:1px solid var(--border);
+  border-radius:var(--radius); padding:14px 16px; transition:all .2s;
+}
+.kpi-card:hover { border-color:var(--border-active); }
+.kpi-label { font-size:11px; color:var(--text3); margin-bottom:5px; letter-spacing:.4px; }
+.kpi-value { font-size:22px; font-weight:700; font-variant-numeric:tabular-nums; }
+.kpi-sub { font-size:10px; color:var(--text3); margin-top:3px; }
+
+/* ── Grid Layouts ── */
+.two-col { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:12px; }
+.three-col { display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; margin-bottom:12px; }
+
+/* ── Chart Box ── */
+.chart-box {
+  background:var(--card); border:1px solid var(--border);
+  border-radius:var(--radius); padding:14px; margin-bottom:12px;
+}
+.chart-box .ct { font-size:13px; font-weight:600; color:var(--text2); margin-bottom:8px; padding-left:4px; border-left:3px solid var(--cyan); }
+.chart-box .ct.amber { border-left-color:var(--amber); }
+.chart-box .ct.emerald { border-left-color:var(--emerald); }
+.chart { width:100%; height:340px; }
+.chart.sm { height:260px; }
+.chart.lg { height:420px; }
+
+/* ── Quadrant Cards (material cockpit) ── */
+.quad-row { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; margin-bottom:14px; }
+.quad-card {
+  background:var(--card); border:1px solid var(--border);
+  border-radius:var(--radius); padding:12px 14px;
+  text-align:center; transition:all .2s; cursor:pointer;
+}
+.quad-card:hover { border-color:var(--border-active); transform:translateY(-1px); }
+.quad-card .q-icon { font-size:24px; margin-bottom:4px; }
+.quad-card .q-label { font-size:12px; font-weight:600; margin-bottom:3px; }
+.quad-card .q-count { font-size:22px; font-weight:700; }
+.quad-card .q-cost { font-size:10px; color:var(--text3); margin-top:2px; }
+.quad-card.star { border-left:3px solid var(--emerald); }
+.quad-card.potential { border-left:3px solid var(--amber); }
+.quad-card.watch { border-left:3px solid var(--cyan); }
+.quad-card.stop { border-left:3px solid var(--rose); }
+
+/* ── Action List ── */
+.action-section h3 { font-size:13px; color:var(--text2); margin-bottom:8px; padding-left:4px; border-left:3px solid var(--amber); }
+.action-item {
+  display:flex; flex-wrap:wrap; align-items:center; gap:5px 8px;
+  padding:8px 12px; background:var(--card); border:1px solid var(--border);
+  border-radius:8px; font-size:12px; margin-bottom:5px;
+}
+.a-badge { padding:2px 7px; border-radius:4px; font-size:10px; font-weight:600; white-space:nowrap; }
+.a-badge.scale { background:rgba(16,185,129,.15); color:var(--emerald); }
+.a-badge.pause { background:rgba(244,63,94,.15); color:var(--rose); }
+.a-badge.abandon { background:rgba(244,63,94,.2); color:#ff6b81; }
+.a-id { font-family:monospace; font-size:10px; color:var(--text3); background:rgba(255,255,255,.04); padding:2px 5px; border-radius:3px; cursor:copy; user-select:all; }
+
+/* ── Account Report ── */
+.report-section {
+  background:var(--card); border:1px solid var(--border);
+  border-radius:var(--radius); padding:14px; margin-bottom:12px;
+}
+.report-kpi-card {
+  background:var(--card); border:1px solid var(--border);
+  border-radius:var(--radius); padding:10px 12px; text-align:center;
+  transition:all .2s;
+}
+.report-kpi-card:hover { border-color:var(--border-active); }
+.report-kpi-card .rk-label { font-size:10px; color:var(--text3); margin-bottom:3px; }
+.report-kpi-card .rk-value { font-size:18px; font-weight:700; }
+.report-kpi-card .rk-sub { font-size:9px; color:var(--text3); margin-top:2px; }
+.empty-hint { padding:20px; text-align:center; color:var(--text3); font-size:13px; }
+.report-table { width:100%; border-collapse:collapse; font-size:11px; }
+.report-table th { padding:6px 8px; text-align:left; color:var(--text3); font-weight:600; border-bottom:1px solid var(--border); background:rgba(255,255,255,.02); white-space:nowrap; }
+.report-table td { padding:4px 8px; border-bottom:1px solid rgba(255,255,255,.03); white-space:nowrap; }
+.report-table tr:hover td { background:rgba(255,255,255,.02); }
+.report-table .num { text-align:right; font-variant-numeric:tabular-nums; }
+.report-table .good { color:var(--emerald); }
+.report-table .bad { color:var(--rose); }
+@media (max-width:768px) {
+  .report-table { font-size:10px; }
+  .report-table th, .report-table td { padding:3px 5px; }
+}
+.a-name { flex:1; min-width:100px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.a-account { font-size:11px; color:var(--cyan); white-space:nowrap; max-width:90px; overflow:hidden; text-overflow:ellipsis; }
+.a-meta { font-size:11px; color:var(--text3); white-space:nowrap; }
+
+/* ── Tables ── */
+.tbl-wrap { overflow-x:auto; max-height:65vh; overflow-y:auto; }
+table { width:100%; border-collapse:collapse; font-size:12px; min-width:700px; }
+thead th {
+  padding:8px 10px; text-align:right; font-size:11px; font-weight:600;
+  color:var(--text3); border-bottom:1px solid var(--border);
+  position:sticky; top:0; background:rgba(14,20,52,.98);
+  cursor:pointer; white-space:nowrap;
+}
+thead th:first-child, thead th:nth-child(2) { text-align:left; }
+thead th:hover { color:var(--cyan); }
+thead th.sorted { color:var(--cyan); }
+.sort-indicator { margin-left:2px; font-size:10px; opacity:.4; }
+thead th.sorted .sort-indicator { opacity:1; }
+tbody td {
+  padding:7px 10px; text-align:right; border-bottom:1px solid rgba(255,255,255,.03);
+  white-space:nowrap; font-variant-numeric:tabular-nums;
+}
+tbody td:first-child { text-align:left; font-size:11px; color:var(--text3); }
+tbody td:nth-child(2) { text-align:left; }
+tbody tr:hover { background:rgba(0,212,255,.03); }
+td.good { color:var(--emerald); font-weight:600; }
+td.bad { color:var(--rose); font-weight:600; }
+td.mid { color:var(--amber); }
+td.action-scale { color:var(--emerald); font-weight:600; }
+td.action-pause, td.action-abandon { color:var(--rose); font-weight:600; }
+td.action-maintain { color:var(--amber); }
+td.action-watch { color:var(--text3); }
+
+/* ── Account Cards ── */
+.acc-list { display:grid; gap:8px; }
+.acc-card { background:var(--card); border:1px solid var(--border); border-radius:var(--radius); overflow:hidden; }
+.acc-header {
+  display:flex; align-items:center; gap:10px;
+  padding:12px 16px; cursor:pointer; user-select:none; transition:background .2s;
+}
+.acc-header:hover { background:rgba(255,255,255,.02); }
+.acc-header .acc-name { font-weight:600; font-size:14px; flex:1; }
+.acc-health { padding:3px 10px; border-radius:12px; font-size:12px; font-weight:600; }
+.acc-health.good { background:rgba(16,185,129,.15); color:var(--emerald); }
+.acc-health.ok { background:rgba(245,158,11,.15); color:var(--amber); }
+.acc-health.bad { background:rgba(244,63,94,.15); color:var(--rose); }
+.acc-header .acc-stats { display:flex; gap:14px; font-size:11px; color:var(--text3); flex-wrap:wrap; }
+.acc-arrow { font-size:12px; color:var(--text3); transition:transform .2s; }
+.acc-header.open .acc-arrow { transform:rotate(90deg); }
+.acc-detail { display:none; padding:0 16px 16px; border-top:1px solid var(--border); }
+.acc-detail.show { display:block; }
+
+/* ── Suggestion cards ── */
+.sug-list { display:grid; gap:10px; }
+.sug-card { background:var(--card); border:1px solid var(--border); border-radius:var(--radius); padding:16px; }
+.sug-card.high { border-left:3px solid var(--rose); }
+.sug-card.medium { border-left:3px solid var(--amber); }
+.sug-card .sug-title { font-size:14px; font-weight:600; margin-bottom:6px; }
+.sug-card .sug-body { font-size:13px; color:var(--text2); line-height:1.6; }
+.sug-priority { display:inline-block; padding:2px 8px; border-radius:4px; font-size:10px; font-weight:600; margin-bottom:8px; }
+.sug-priority.high { background:rgba(244,63,94,.12); color:var(--rose); }
+.sug-priority.medium { background:rgba(245,158,11,.12); color:var(--amber); }
+
+/* ── Battle List Cards ── */
+.battle-tables { display:flex; flex-direction:column; gap:10px; }
+.battle-card { background:var(--panel); border:1px solid var(--border); border-radius:10px; overflow:hidden; }
+.battle-header { display:flex; align-items:center; gap:10px; padding:12px 16px; cursor:pointer; user-select:none; }
+.battle-header:hover { background:rgba(255,255,255,.03); }
+.battle-icon { font-size:16px; }
+.battle-title { font-size:14px; font-weight:600; color:var(--text1); flex:1; }
+.battle-count { font-size:12px; color:var(--text3); min-width:40px; text-align:right; }
+.battle-toggle { font-size:12px; color:var(--text3); transition:transform .2s; }
+.battle-toggle.open { transform:rotate(180deg); }
+.battle-body { display:none; padding:0 16px 12px; }
+.battle-body.show { display:block; }
+.battle-row { display:flex; align-items:center; gap:12px; padding:8px 0; border-bottom:1px solid rgba(255,255,255,.04); font-size:12px; }
+.battle-row:last-child { border-bottom:none; }
+.battle-row .bt-name { flex:1; color:var(--text1); min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.battle-row .bt-acc { color:var(--text3); font-size:11px; max-width:100px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.battle-row .bt-cost { color:var(--text2); min-width:70px; text-align:right; }
+.battle-row .bt-clue { color:var(--green); min-width:50px; text-align:right; }
+.battle-row .bt-meta { color:var(--text3); min-width:120px; text-align:right; font-size:11px; }
+.battle-trap-tag { display:inline-block; padding:1px 6px; border-radius:4px; background:rgba(244,63,94,.12); color:var(--rose); font-size:10px; font-weight:600; }
+
+/* ── Material Modal ── */
+.modal-overlay { display:none; position:fixed; inset:0; z-index:1000; background:rgba(0,0,0,.65); backdrop-filter:blur(4px); align-items:center; justify-content:center; }
+.modal-overlay.show { display:flex; }
+.modal-box { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:22px; max-width:640px; width:90%; max-height:85vh; overflow-y:auto; box-shadow:0 20px 60px rgba(0,0,0,.5); }
+.modal-close { float:right; background:none; border:none; color:var(--text3); font-size:20px; cursor:pointer; padding:0 4px; line-height:1; }
+.modal-close:hover { color:var(--text); }
+.modal-section { margin-bottom:14px; }
+.modal-section h4 { font-size:11px; font-weight:600; color:var(--text3); text-transform:uppercase; letter-spacing:.5px; margin-bottom:7px; padding-bottom:4px; border-bottom:1px solid var(--border); }
+.modal-field { display:flex; padding:3px 0; font-size:13px; }
+.modal-field .mf-label { flex:0 0 80px; color:var(--text3); }
+.modal-field .mf-value { color:var(--text); word-break:break-all; flex:1; }
+.clickable-row { cursor:pointer; }
+.clickable-row:hover { background:rgba(0,212,255,.06) !important; }
+
+/* ── Filter Row ── */
+.filter-row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:10px; }
+.filter-row select, .filter-row input {
+  background:var(--card); color:var(--text); border:1px solid var(--border);
+  border-radius:6px; padding:5px 10px; font-size:12px;
+}
+.filter-row input { flex:1; min-width:120px; }
+
+/* ── Progress Bar ── */
+.cost-bar { display:flex; align-items:center; gap:6px; }
+.cost-bar-bg { flex:1; height:5px; background:rgba(255,255,255,.06); border-radius:3px; min-width:40px; }
+.cost-bar-fill { height:100%; border-radius:3px; background:linear-gradient(90deg,var(--cyan),var(--purple)); }
+
+/* ── Responsive ── */
+@media (max-width:900px) {
+  .two-col, .three-col { grid-template-columns:1fr; }
+  .quad-row { grid-template-columns:repeat(2,1fr); }
+}
+@media (max-width:768px) {
+  .container { padding:10px; }
+  .kpi-row { grid-template-columns:repeat(2,1fr); gap:8px; }
+  .kpi-value { font-size:18px; }
+  .chart { height:260px; } .chart.lg { height:300px; }
+  .cockpit-btn { padding:10px 16px; font-size:13px; }
+}
+@media (max-width:480px) {
+  .quad-row { grid-template-columns:1fr 1fr; }
+  .cockpit-btn { padding:10px 12px; font-size:12px; }
+}
+</style>
+</head>
+<body>
+
+<!-- ── Header ── -->
+<div class="header">
+  <div class="header-left">
+    <span style="font-size:22px;">📊</span>
+    <h1>三老板 · 投流数据驾驶舱</h1>
+    <span style="font-size:10px;color:var(--text3);padding:2px 6px;background:rgba(255,255,255,.04);border-radius:4px;">v3</span>
+  </div>
+  <div class="header-right">
+    <span style="color:var(--text3);" id="dataDateLabel">数据截至：</span>
+    <span id="dataDate" style="color:var(--amber);font-weight:600;font-size:13px;">--</span>
+    <span id="syncStatus" style="font-size:11px;"></span>
+    <button class="sync-btn" id="btnSyncNow" onclick="triggerSync()">立即同步</button>
+    <button class="sync-btn amber" id="btnBackfill" onclick="triggerBackfill()">补历史数据</button>
+    <span id="updateTime" style="font-size:11px;color:var(--text3);">--</span>
+  </div>
+</div>
+
+<!-- ── Cockpit Switcher ── -->
+<div class="cockpit-bar">
+  <button class="cockpit-btn active" data-cockpit="material" onclick="switchCockpit('material')">🎯 素材驾驶舱</button>
+  <button class="cockpit-btn" data-cockpit="account" onclick="switchCockpit('account')">💰 投流账户驾驶舱</button>
+  <button class="cockpit-btn" data-cockpit="battle" onclick="switchCockpit('battle')">⚔️ 每日作战清单</button>
+  <button class="cockpit-btn" data-cockpit="report" onclick="switchCockpit('report')">📋 账户报告</button>
+</div>
+
+<!-- ── Date Bar ── -->
+<div class="date-bar" id="dateBar">
+  <button class="dq-btn" id="btnLatest" onclick="setLatest()">最新</button>
+  <button class="dq-btn" id="btn7d" onclick="setDays(7)">近7天</button>
+  <button class="dq-btn" id="btn14d" onclick="setDays(14)">近14天</button>
+  <button class="dq-btn" id="btn30d" onclick="setDays(30)">近30天</button>
+  <label>开始：<input type="date" id="startDate"></label>
+  <label>结束：<input type="date" id="endDate"></label>
+  <button class="dq-btn primary" onclick="loadCurrentCockpit()">查询</button>
+  <span id="dateRangeLabel" style="color:var(--text3);font-size:11px;margin-left:4px;"></span>
+</div>
+
+<!-- ================================================================
+     COCKPIT 1: 素材驾驶舱
+     ================================================================ -->
+<div class="cockpit-content active" id="cockpit-material">
+  <div class="tab-bar" id="matTabBar">
+    <button class="tab-btn active" data-tab="overview" onclick="switchMatTab('overview')">决策总览</button>
+    <button class="tab-btn" data-tab="accounts" onclick="switchMatTab('accounts')">账户穿透 <span class="tab-badge" id="accBadge"></span></button>
+    <button class="tab-btn" data-tab="ranking" onclick="switchMatTab('ranking')">素材全榜 <span class="tab-badge" id="rankBadge"></span></button>
+    <button class="tab-btn" data-tab="suggestions" onclick="switchMatTab('suggestions')">优化建议</button>
+  </div>
+  <div class="container">
+    <!-- 决策总览 -->
+    <div class="tab-content active" id="mat-tab-overview">
+      <div class="kpi-row" id="matKpiCards"></div>
+      <div class="quad-row" id="quadCards"></div>
+      <div class="chart-box">
+        <div class="ct">素材投资决策矩阵 · X=转化成本 · Y=消耗 · 气泡=留资数 · ⚠️🪤标记陷阱</div>
+        <div class="chart" id="matrixChart"></div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;" id="actionGrid">
+        <div class="action-section">
+          <h3>🔥 建议放量</h3>
+          <div id="scaleUpList"></div>
+        </div>
+        <div class="action-section">
+          <h3>⚠️ 建议暂停</h3>
+          <div id="pauseList"></div>
+        </div>
+      </div>
+    </div>
+    <!-- 账户穿透 -->
+    <div class="tab-content" id="mat-tab-accounts">
+      <div class="acc-list" id="matAccList"></div>
+    </div>
+    <!-- 素材全榜 -->
+    <div class="tab-content" id="mat-tab-ranking">
+      <div class="filter-row">
+        <select id="filterAction" onchange="applyRankingFilter()">
+          <option value="">全部动作</option>
+          <option value="scale_up">放量</option>
+          <option value="maintain">维持</option>
+          <option value="watch">观察</option>
+          <option value="pause">暂停</option>
+          <option value="abandon">放弃</option>
+        </select>
+        <select id="filterAccount" onchange="applyRankingFilter()">
+          <option value="">全部账户</option>
+        </select>
+        <input type="text" id="filterSearch" placeholder="搜索素材名称..." oninput="applyRankingFilter()">
+        <span style="font-size:11px;color:var(--text3);" id="filterCount"></span>
+      </div>
+      <div class="tbl-wrap" id="rankingTable"></div>
+    </div>
+    <!-- 优化建议 -->
+    <div class="tab-content" id="mat-tab-suggestions">
+      <div class="sug-list" id="sugList"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ================================================================
+     COCKPIT 2: 投流账户驾驶舱
+     ================================================================ -->
+<div class="cockpit-content" id="cockpit-account">
+  <div class="tab-bar" id="adTabBar">
+    <button class="tab-btn active" data-tab="kpi" onclick="switchAdTab('kpi')">全局总览</button>
+    <button class="tab-btn" data-tab="trend" onclick="switchAdTab('trend')">消耗趋势</button>
+    <button class="tab-btn" data-tab="projects" onclick="switchAdTab('projects')">项目分析</button>
+    <button class="tab-btn" data-tab="promotions" onclick="switchAdTab('promotions')">单元排行</button>
+  </div>
+  <div class="container">
+
+    <!-- 全局总览 -->
+    <div class="tab-content active" id="ad-tab-kpi">
+      <div class="kpi-row" id="adGlobalKpi"></div>
+      <div class="chart-box" style="margin-bottom:12px;">
+        <div class="ct amber">账户消耗占比</div>
+        <div style="display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap;">
+          <div id="adPieChart" style="flex:0 0 300px;height:280px;"></div>
+          <div id="adAccountList" style="flex:1;min-width:300px;overflow-x:auto;"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 消耗趋势 -->
+    <div class="tab-content" id="ad-tab-trend">
+      <div class="filter-row" style="margin-bottom:10px;">
+        <select id="trendAccountFilter" onchange="loadAdTrend()">
+          <option value="">全部账户（合计）</option>
+        </select>
+        <span style="font-size:11px;color:var(--text3);">切换账户查看其独立趋势</span>
+      </div>
+      <div class="chart-box">
+        <div class="ct">每日消耗 · ¥</div>
+        <div class="chart lg" id="adCostTrendChart"></div>
+      </div>
+      <div class="two-col">
+        <div class="chart-box">
+          <div class="ct emerald">每日线索量</div>
+          <div class="chart" id="adClueTrendChart"></div>
+        </div>
+        <div class="chart-box">
+          <div class="ct amber">CTR 趋势 %</div>
+          <div class="chart" id="adCtrTrendChart"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 项目分析 -->
+    <div class="tab-content" id="ad-tab-projects">
+      <div class="filter-row">
+        <select id="projAccountFilter" onchange="loadAdProjects()">
+          <option value="">全部账户</option>
+        </select>
+        <span style="font-size:11px;color:var(--text3);" id="projCount"></span>
+      </div>
+      <div class="tbl-wrap" id="projectTable"></div>
+    </div>
+
+    <!-- 单元排行 -->
+    <div class="tab-content" id="ad-tab-promotions">
+      <div class="filter-row">
+        <select id="promoAccountFilter" onchange="loadAdPromotions()">
+          <option value="">全部账户</option>
+        </select>
+        <input type="text" id="promoSearch" placeholder="搜索单元名称..." style="flex:1;min-width:120px;" oninput="filterPromoTable()">
+        <span style="font-size:11px;color:var(--text3);" id="promoCount"></span>
+      </div>
+      <div class="tbl-wrap" id="promoTable"></div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ================================================================
+     COCKPIT 3: 每日作战清单
+     ================================================================ -->
+<div class="cockpit-content" id="cockpit-battle">
+  <div class="container">
+    <div id="battleWindow" style="font-size:12px;color:var(--cyan);margin-bottom:12px;">加载中…</div>
+
+    <!-- 五张作战表，每张可折叠 -->
+    <div class="battle-tables">
+      <!-- ① 放量清单 -->
+      <div class="battle-card" style="border-left:3px solid var(--green);">
+        <div class="battle-header" onclick="toggleBattleCard(this)">
+          <span class="battle-icon">🚀</span>
+          <span class="battle-title">放量清单</span>
+          <span class="battle-count" id="btScaleCount">--</span>
+          <span class="battle-toggle">▼</span>
+        </div>
+        <div class="battle-body" id="btScaleTable"></div>
+      </div>
+
+      <!-- ② 降量清单 -->
+      <div class="battle-card" style="border-left:3px solid var(--red);">
+        <div class="battle-header" onclick="toggleBattleCard(this)">
+          <span class="battle-icon">📉</span>
+          <span class="battle-title">降量清单</span>
+          <span class="battle-count" id="btCutCount">--</span>
+          <span class="battle-toggle">▼</span>
+        </div>
+        <div class="battle-body" id="btCutTable"></div>
+      </div>
+
+      <!-- ③ 疲劳预警 -->
+      <div class="battle-card" style="border-left:3px solid var(--amber);">
+        <div class="battle-header" onclick="toggleBattleCard(this)">
+          <span class="battle-icon">⚠️</span>
+          <span class="battle-title">疲劳预警</span>
+          <span class="battle-count" id="btFatigueCount">--</span>
+          <span class="battle-toggle">▼</span>
+        </div>
+        <div class="battle-body" id="btFatigueTable"></div>
+      </div>
+
+      <!-- ④ 陷阱标记 -->
+      <div class="battle-card" style="border-left:3px solid var(--pink);">
+        <div class="battle-header" onclick="toggleBattleCard(this)">
+          <span class="battle-icon">🪤</span>
+          <span class="battle-title">陷阱标记（便宜但留资差）</span>
+          <span class="battle-count" id="btTrapCount">--</span>
+          <span class="battle-toggle">▼</span>
+        </div>
+        <div class="battle-body" id="btTrapTable"></div>
+      </div>
+
+      <!-- ⑤ 排查清单 -->
+      <div class="battle-card" style="border-left:3px solid var(--text3);">
+        <div class="battle-header" onclick="toggleBattleCard(this)">
+          <span class="battle-icon">🔍</span>
+          <span class="battle-title">排查清单（0消耗/异常）</span>
+          <span class="battle-count" id="btCheckCount">--</span>
+          <span class="battle-toggle">▼</span>
+        </div>
+        <div class="battle-body" id="btCheckTable"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ================================================================
+     COCKPIT 4: 账户报告
+     ================================================================ -->
+<div class="cockpit-content" id="cockpit-report">
+  <div class="container">
+    <!-- 账户选择 + 导出 -->
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;flex-wrap:wrap;">
+      <label style="color:var(--text2);font-size:13px;">选择账户：</label>
+      <select id="reportAccountSelect" onchange="loadAccountReport()" style="padding:6px 10px;border-radius:6px;background:var(--card);color:var(--text1);border:1px solid var(--border);font-size:13px;min-width:260px;">
+        <option value="">-- 请选择账户 --</option>
+      </select>
+      <span id="reportPeriod" style="color:var(--text3);font-size:12px;"></span>
+      <button id="btnExportWord" onclick="exportAccountReport()" style="margin-left:auto;padding:8px 18px;border-radius:6px;background:linear-gradient(135deg,#3b82f6,#1d4ed8);color:#fff;border:none;font-size:13px;font-weight:600;cursor:pointer;display:none;">
+        📥 导出Word报告
+      </button>
+    </div>
+
+    <!-- KPI 卡片 -->
+    <div id="reportKpiCards" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:10px;margin-bottom:16px;"></div>
+
+    <!-- [DEPRECATED 2026-06-28] 投放类型拆分已移除（按 SKILL.md 规范） -->
+
+    <!-- 趋势图 -->
+    <div class="report-section">
+      <h4 style="color:var(--cyan);margin:0 0 8px;">📈 每日趋势</h4>
+      <div id="reportTrendChart" style="width:100%;height:320px;"></div>
+    </div>
+
+    <!-- 项目排行 -->
+    <div class="report-section">
+      <h4 style="color:var(--cyan);margin:0 0 8px;">📊 项目排行</h4>
+      <div id="reportProjects"><div class="empty-hint">选择账户后加载</div></div>
+    </div>
+
+    <!-- 投放单元排行 -->
+    <div class="report-section">
+      <h4 style="color:var(--cyan);margin:0 0 8px;">📋 投放单元排行 (TOP 30)</h4>
+      <div id="reportPromotions"><div class="empty-hint">选择账户后加载</div></div>
+    </div>
+
+    <!-- 素材排行 -->
+    <div class="report-section">
+      <h4 style="color:var(--cyan);margin:0 0 8px;">🎬 素材排行 (TOP 30)</h4>
+      <div id="reportMaterials"><div class="empty-hint">选择账户后加载</div></div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Material Modal ── -->
+<div class="modal-overlay" id="matModal">
+  <div class="modal-box">
+    <button class="modal-close" onclick="closeModal()">✕</button>
+    <div style="font-size:17px;font-weight:600;margin-bottom:14px;padding-right:24px;" id="matModalTitle">素材详情</div>
+    <div class="modal-section"><h4>基本信息</h4><div id="matModalFields"></div></div>
+    <div class="modal-section"><h4 id="matModalDocTitle">每日数据明细</h4><div id="matModalDaily"></div></div>
+  </div>
+</div>
+
+<script>
+// ─────────────────────────────────────────────────
+//  Format helpers
+// ─────────────────────────────────────────────────
+const F = {
+  money(n) {
+    if (n == null || isNaN(n)) return '--';
+    if (n >= 1e4) return '¥'+(n/1e4).toFixed(1)+'万';
+    return '¥'+Math.round(n).toLocaleString();
+  },
+  num(n) {
+    if (n == null || isNaN(n)) return '--';
+    if (n >= 1e8) return (n/1e8).toFixed(1)+'亿';
+    if (n >= 1e4) return (n/1e4).toFixed(1)+'万';
+    return Math.round(n).toLocaleString();
+  },
+  pct(v) { return (v == null || isNaN(v)) ? '--' : v.toFixed(2)+'%'; },
+  cpa(v) { return (v == null || isNaN(v) || v <= 0) ? '--' : '¥'+Math.round(v); },
+};
+
+// ─────────────────────────────────────────────────
+//  State
+// ─────────────────────────────────────────────────
+const S = {
+  cockpit: 'material',
+  matTab: 'overview', adTab: 'kpi',
+  decision: null, ranking: [],
+  adOverview: null, adTrend: null, adProjects: [], adPromos: [],
+  charts: {},
+  sortCol: null, sortDir: null,
+  promoSortCol: null, promoSortDir: null, projSortCol: null, projSortDir: null,
+  reportData: null, reportAccountId: null,
+};
+
+// ─────────────────────────────────────────────────
+//  Cockpit / Tab switching
+// ─────────────────────────────────────────────────
+function switchCockpit(name) {
+  S.cockpit = name;
+  document.querySelectorAll('.cockpit-btn').forEach(b => b.classList.toggle('active', b.dataset.cockpit === name));
+  document.querySelectorAll('.cockpit-content').forEach(c => c.classList.toggle('active', c.id === 'cockpit-'+name));
+  loadCurrentCockpit();
+}
+
+function switchMatTab(tab) {
+  S.matTab = tab;
+  document.querySelectorAll('#matTabBar .tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
+  document.querySelectorAll('#cockpit-material .tab-content').forEach(c => c.classList.toggle('active', c.id === 'mat-tab-'+tab));
+  if (tab === 'overview' && S.charts.matrix) S.charts.matrix.resize();
+}
+
+function switchAdTab(tab) {
+  S.adTab = tab;
+  document.querySelectorAll('#adTabBar .tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
+  document.querySelectorAll('#cockpit-account .tab-content').forEach(c => c.classList.toggle('active', c.id === 'ad-tab-'+tab));
+  // Lazy load
+  if (tab === 'trend' && !S.adTrend) loadAdTrend();
+  if (tab === 'projects' && !S.adProjects.length) loadAdProjects();
+  if (tab === 'promotions' && !S.adPromos.length) loadAdPromotions();
+  Object.values(S.charts).forEach(ch => { try { ch.resize(); } catch(_){} });
+}
+
+// ─────────────────────────────────────────────────
+//  Date helpers
+// ─────────────────────────────────────────────────
+function todayBJ() {
+  const bj = new Date(Date.now() + 8*3600*1000);
+  return bj.toISOString().slice(0,10);
+}
+function offsetDate(base, days) {
+  const d = new Date(base+'T00:00:00Z');
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0,10);
+}
+function setLatest() {
+  document.getElementById('startDate').value = '';
+  document.getElementById('endDate').value = '';
+  loadCurrentCockpit();
+}
+function setDays(n) {
+  const end = S.decision?.date || todayBJ();
+  const start = offsetDate(end, -(n-1));
+  document.getElementById('startDate').value = start;
+  document.getElementById('endDate').value = end;
+  loadCurrentCockpit();
+}
+function getDateParams() {
+  const s = document.getElementById('startDate').value;
+  const e = document.getElementById('endDate').value;
+  return { start: s, end: e };
+}
+function buildQs(extra = {}) {
+  const { start, end } = getDateParams();
+  const p = new URLSearchParams();
+  if (start) p.set('start_date', start);
+  if (end) p.set('end_date', end);
+  Object.entries(extra).forEach(([k,v]) => { if (v) p.set(k, v); });
+  return p.toString() ? '?' + p.toString() : '';
+}
+
+// ─────────────────────────────────────────────────
+//  Main loader
+// ─────────────────────────────────────────────────
+function loadCurrentCockpit() {
+  if (S.cockpit === 'material') loadMaterial();
+  else if (S.cockpit === 'battle') loadBattleList();
+  else if (S.cockpit === 'report') populateReportAccounts();
+  else loadAdCockpit();
+}
+
+// ─────────────────────────────────────────────────
+//  MATERIAL COCKPIT
+// ─────────────────────────────────────────────────
+async function loadMaterial() {
+  const qs = buildQs();
+  document.getElementById('updateTime').textContent = '加载中…';
+  try {
+    const [dec, rank] = await Promise.all([
+      fetch('/api/decision' + qs).then(r=>r.json()),
+      fetch('/api/ranking' + qs).then(r=>r.json()),
+    ]);
+    S.decision = dec;
+    S.ranking = rank.materials || [];
+    document.getElementById('dataDate').textContent = dec.date || '--';
+    const shouldFill = !getDateParams().start && !getDateParams().end;
+    if (shouldFill && /^\d{4}/.test(dec.date || '')) {
+      document.getElementById('startDate').value = dec.date;
+      document.getElementById('endDate').value = dec.date;
+    }
+    document.getElementById('accBadge').textContent = (dec.accounts||[]).length;
+    document.getElementById('rankBadge').textContent = S.ranking.length;
+    renderMaterialAll();
+    document.getElementById('updateTime').textContent = '更新 ' + new Date().toLocaleTimeString('zh-CN');
+  } catch(e) {
+    document.getElementById('updateTime').textContent = '加载失败: '+e.message;
+  }
+}
+
+function renderMaterialAll() {
+  renderMatKPIs(); renderQuadrants(); renderMatrixChart();
+  renderScaleUp(); renderPause(); renderMatAccounts();
+  renderRankingTable(); renderFilters(); renderSuggestions();
+}
+
+function renderMatKPIs() {
+  const d = S.decision; if (!d) return;
+  const q = d.quadrant_summary || {};
+  const totalCost = Object.values(q).reduce((s,v)=>s+(v.total_cost||0),0);
+  const cards = [
+    {label:'素材总数', value:F.num(d.total_materials||0), sub:'全部素材', color:'#94a3b8'},
+    {label:'总消耗', value:F.money(totalCost), sub:'当期', color:'#38bdf8'},
+    {label:'明星素材', value:(q.star||{}).count||0, sub:'建议放量', color:'var(--emerald)'},
+    {label:'淘汰素材', value:(q.stop||{}).count||0, sub:'建议暂停', color:'var(--rose)'},
+    {label:'活跃账户', value:(d.accounts||[]).length, sub:'已接入', color:'var(--purple)'},
+    {label:'可释放预算', value:F.money((q.stop||{}).total_cost||0), sub:'淘汰素材消耗', color:'var(--amber)'},
+  ];
+  document.getElementById('matKpiCards').innerHTML = cards.map(c =>
+    `<div class="kpi-card"><div class="kpi-label">${c.label}</div><div class="kpi-value" style="color:${c.color}">${c.value}</div><div class="kpi-sub">${c.sub}</div></div>`
+  ).join('');
+}
+
+function renderQuadrants() {
+  const q = S.decision?.quadrant_summary; if (!q) return;
+  const items = [
+    {key:'star',icon:'⭐',label:'明星素材',cls:'star'},
+    {key:'potential',icon:'💪',label:'潜力素材',cls:'potential'},
+    {key:'watch',icon:'👀',label:'观察素材',cls:'watch'},
+    {key:'stop',icon:'❌',label:'淘汰素材',cls:'stop'},
+  ];
+  document.getElementById('quadCards').innerHTML = items.map(it => {
+    const v = q[it.key]||{};
+    return `<div class="quad-card ${it.cls}" onclick="filterQuadrant('${it.key}')">
+      <div class="q-icon">${it.icon}</div><div class="q-label">${it.label}</div>
+      <div class="q-count">${v.count||0} 条</div><div class="q-cost">消耗 ${F.money(v.total_cost)}</div>
+    </div>`;
+  }).join('');
+}
+
+function renderMatrixChart() {
+  const scatter = S.decision?.decision_matrix;
+  const el = document.getElementById('matrixChart');
+  if (!el || !scatter?.length) return;
+  if (typeof echarts === 'undefined') return;
+  if (S.charts.matrix) S.charts.matrix.dispose();
+  S.charts.matrix = echarts.init(el);
+  const colors = {star:'#10b981',potential:'#f59e0b',watch:'#00d4ff',stop:'#f43f5e',insufficient:'#64748b'};
+  const qnames = {star:'明星',potential:'潜力',watch:'观察',stop:'淘汰',insufficient:'数据不足'};
+  const groups = {};
+  scatter.forEach(s => { const q=s.quadrant||'watch'; if(!groups[q]) groups[q]=[]; groups[q].push(s); });
+  const series = Object.entries(groups).map(([q,items]) => ({
+    name:qnames[q]||q, type:'scatter',
+    data:items.map(s=>[s.x||0,s.y||0,s.r||3,s.name||'',s.id||'']),
+    symbolSize:d=>d[2], itemStyle:{color:colors[q]||'#94a3b8',opacity:.7},
+    emphasis:{itemStyle:{opacity:1,borderColor:'#fff',borderWidth:1}}
+  }));
+  S.charts.matrix.setOption({
+    backgroundColor:'transparent',
+    tooltip:{trigger:'item',backgroundColor:'rgba(10,15,41,.95)',borderColor:'rgba(0,212,255,.2)',
+      textStyle:{color:'#e2e8f0',fontSize:12},
+      formatter:p=>{const d=p.data;const trap=d[5]?' 🪤陷阱':'';return `<strong>${d[3]||d[4]}</strong>${trap}<br/>转化成本:¥${d[0].toFixed(0)} 消耗:${F.money(d[1])}<br/>留资:${d[2]>0?' '+Math.round(d[2]):'--'} 象限:${p.seriesName}`}},
+    legend:{data:series.map(s=>s.name),bottom:0,textStyle:{color:'#94a3b8',fontSize:11},itemWidth:10,itemHeight:7},
+    grid:{left:60,right:30,top:20,bottom:40},
+    xAxis:{type:'value',name:'转化成本/¥',nameTextStyle:{color:'#94a3b8',fontSize:11},
+      splitLine:{lineStyle:{color:'rgba(255,255,255,.04)'}},axisLabel:{color:'#94a3b8',fontSize:11,formatter:v=>'¥'+Math.round(v)},min:0},
+    yAxis:{type:'value',name:'消耗/¥',nameTextStyle:{color:'#94a3b8',fontSize:11},
+      splitLine:{lineStyle:{color:'rgba(255,255,255,.04)'}},axisLabel:{color:'#94a3b8',fontSize:11,formatter:v=>F.money(v)},min:0},
+    series
+  });
+}
+
+function buildActionItems(list, defaultBadge) {
+  return list.map(m => {
+    const badge = m.action_label||(m.action==='abandon'?'淘汰':defaultBadge);
+    const cls = m.action==='abandon'?'abandon':(m.action==='scale_up'?'scale':'pause');
+    const mid = (m.material_id||m.id||'').replace(/'/g,"\\'");
+    return `<div class="action-item clickable-row" onclick="showMaterialDetail('${mid}')">
+      <span class="a-badge ${cls}">${badge}</span>
+      <span class="a-id" onclick="event.stopPropagation();copyText('${mid}')" title="点击复制">${mid.slice(-12)}</span>
+      <span class="a-name" title="${(m.material_name||'').replace(/"/g,'&quot;')}">${(m.material_name||'').slice(0,28)}</span>
+      <span class="a-account">${m.account_name||(m.account_id||'').slice(-6)}</span>
+      <span class="a-meta">花费${F.money(m.total_cost)} CTR${F.pct(m.ctr)} 效率${(m.efficiency_score||0).toFixed(0)}</span>
+    </div>`;
+  }).join('');
+}
+
+function renderScaleUp() {
+  const list = S.decision?.scale_up_candidates||[];
+  document.getElementById('scaleUpList').innerHTML = list.length
+    ? buildActionItems(list,'放量')
+    : '<div style="padding:10px;color:var(--text3);text-align:center;">暂无</div>';
+}
+function renderPause() {
+  const list = S.decision?.pause_candidates||[];
+  document.getElementById('pauseList').innerHTML = list.length
+    ? buildActionItems(list,'暂停')
+    : '<div style="padding:10px;color:var(--text3);text-align:center;">良好，暂无需暂停的素材</div>';
+}
+
+function renderMatAccounts() {
+  const accounts = S.decision?.accounts||[];
+  document.getElementById('matAccList').innerHTML = accounts.map((a,i) => {
+    const q=a.quadrant||{}; const h=a.health_score||0;
+    const hcls = h>=40?'good':h>=20?'ok':'bad';
+    const hl = h>=40?'良好':h>=20?'一般':'需关注';
+    return `<div class="acc-card">
+      <div class="acc-header" onclick="toggleMatAcc(this,'${a.account_id}')">
+        <span style="font-size:11px;color:var(--text3)">${i+1}</span>
+        <span class="acc-name">${a.account_name||a.account_id.slice(-8)}</span>
+        <span class="acc-health ${hcls}">${h}% ${hl}</span>
+        <span class="acc-stats">
+          <span>消耗 ${F.money(a.total_cost)}</span>
+          <span>素材 ${a.material_count}</span>
+          <span>⭐${(q.star||{}).count||0} 💪${(q.potential||{}).count||0} ❌${(q.stop||{}).count||0}</span>
+        </span>
+        <span class="acc-arrow">▶</span>
+      </div>
+      <div class="acc-detail" id="matAccDetail-${a.account_id}"></div>
+    </div>`;
+  }).join('');
+}
+
+async function toggleMatAcc(header, accountId) {
+  const detail = document.getElementById('matAccDetail-'+accountId);
+  if (detail.classList.contains('show')) { detail.classList.remove('show'); header.classList.remove('open'); return; }
+  detail.innerHTML = '<div style="padding:14px;color:var(--text3);text-align:center;">加载中…</div>';
+  detail.classList.add('show'); header.classList.add('open');
+  try {
+    const qs = buildQs();
+    const data = await fetch('/api/account/'+accountId+qs).then(r=>r.json());
+    const mats = data.materials||[];
+    let html = '<table style="margin-top:8px;"><thead><tr><th>素材ID</th><th>素材名称</th><th>消耗</th><th>CTR</th><th>咨询</th><th>留资</th><th>留资率</th><th>效率分</th><th>动作</th></tr></thead><tbody>';
+    mats.slice(0,20).forEach(m => {
+      const mid = (m.material_id||'').replace(/'/g,"\\'");
+      html += `<tr class="clickable-row" onclick="showMaterialDetail('${mid}')">
+        <td><span class="a-id" onclick="event.stopPropagation();copyText('${mid}')" title="点击复制">${(m.material_id||'').slice(-12)}</span></td>
+        <td style="max-width:150px;overflow:hidden;text-overflow:ellipsis;">${m.material_name||''}</td>
+        <td>${F.money(m.total_cost)}</td><td>${F.pct(m.ctr)}</td>
+        <td>${m.total_consult||0}</td><td>${m.total_clue||0}</td>
+        <td>${F.pct(m.lead_rate)}</td><td>${(m.efficiency_score||0).toFixed(0)}</td>
+        <td class="action-${m.action||'watch'}">${m.action_label||'--'}</td>
+      </tr>`;
+    });
+    detail.innerHTML = html + '</tbody></table>';
+  } catch(e) { detail.innerHTML='<div style="padding:14px;color:var(--rose);">加载失败</div>'; }
+}
+
+// Ranking table
+let matSortCol=null, matSortDir=null;
+function renderRankingTable(filtered) {
+  const list = filtered||S.ranking;
+  document.getElementById('filterCount').textContent = '共'+list.length+'条';
+  if (!list.length) { document.getElementById('rankingTable').innerHTML='<div style="padding:40px;text-align:center;color:var(--text3);">暂无数据</div>'; return; }
+  const cols = [
+    {k:'material_id',l:'素材ID'},{k:'material_name',l:'素材名称'},{k:'account_name',l:'账户'},
+    {k:'total_cost',l:'消耗'},{k:'ctr',l:'CTR'},{k:'total_consult',l:'咨询'},
+    {k:'total_clue',l:'留资'},{k:'lead_rate',l:'留资率'},{k:'lead_cpa',l:'转化成本'},
+    {k:'efficiency_score',l:'效率分'},{k:'action',l:'动作'},
+  ];
+  let html = '<table><thead><tr>' + cols.map(c =>
+    `<th data-sort="${c.k}" onclick="matSort('${c.k}')" class="${matSortCol===c.k?'sorted':''}">${c.l} <span class="sort-indicator">${matSortCol===c.k?(matSortDir==='asc'?'↑':'↓'):'↕'}</span></th>`
+  ).join('') + '</tr></thead><tbody>';
+  list.forEach(m => {
+    const mid = (m.material_id||'').replace(/'/g,"\\'");
+    html += `<tr class="clickable-row" onclick="showMaterialDetail('${mid}')">
+      <td><span class="a-id" onclick="event.stopPropagation();copyText('${mid}')" title="点击复制">${(m.material_id||'').slice(-12)}</span></td>
+      <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;" title="${m.material_name||''}">${m.material_name||'--'}</td>
+      <td>${m.account_name||''}</td><td>${F.money(m.total_cost)}</td><td>${F.pct(m.ctr)}</td>
+      <td>${m.total_consult||0}</td><td>${m.total_clue||0}</td><td>${F.pct(m.lead_rate)}</td>
+      <td>${m.lead_cpa>0?F.money(m.lead_cpa):'--'}</td><td>${(m.efficiency_score||0).toFixed(0)}</td>
+      <td class="action-${m.action||'watch'}">${m.action_label||'--'}</td>
+    </tr>`;
+  });
+  document.getElementById('rankingTable').innerHTML = html + '</tbody></table>';
+}
+
+function matSort(col) {
+  if (matSortCol===col) { matSortDir=matSortDir==='asc'?'desc':null; if(!matSortDir) matSortCol=null; }
+  else { matSortCol=col; matSortDir='asc'; }
+  applyRankingFilter();
+}
+
+function applyRankingFilter() {
+  const action = document.getElementById('filterAction').value;
+  const account = document.getElementById('filterAccount').value;
+  const search = document.getElementById('filterSearch').value.toLowerCase();
+  let f = S.ranking;
+  if (action) f = f.filter(m=>m.action===action);
+  if (account) f = f.filter(m=>m.account_id===account);
+  if (search) f = f.filter(m=>(m.material_name||'').toLowerCase().includes(search)||(m.material_id||'').includes(search));
+  if (matSortCol && matSortDir) {
+    const dir = matSortDir==='asc'?1:-1;
+    f = [...f].sort((a,b) => {
+      let va=a[matSortCol], vb=b[matSortCol];
+      if (typeof va==='string') { va=va.toLowerCase(); vb=(vb||'').toLowerCase(); return va<vb?-dir:va>vb?dir:0; }
+      return ((va||0)-(vb||0))*dir;
+    });
+  }
+  renderRankingTable(f);
+}
+
+function renderFilters() {
+  const accounts = S.decision?.accounts||[];
+  document.getElementById('filterAccount').innerHTML = '<option value="">全部账户</option>' +
+    accounts.map(a=>`<option value="${a.account_id}">${a.account_name||a.account_id.slice(-8)}</option>`).join('');
+}
+
+function filterQuadrant(q) {
+  switchMatTab('ranking');
+  document.getElementById('filterAction').value = q==='star'?'scale_up':q==='potential'?'maintain':q==='stop'?'pause':'';
+  applyRankingFilter();
+}
+
+function renderSuggestions() {
+  const sugs = S.decision?.suggestions||[];
+  document.getElementById('sugList').innerHTML = sugs.length
+    ? sugs.map(s=>`<div class="sug-card ${s.priority||'medium'}">
+        <span class="sug-priority ${s.priority||'medium'}">${s.priority==='high'?'高优':'建议'}</span>
+        <div class="sug-title">${s.title||''}</div>
+        <div class="sug-body">${s.body||''}</div>
+      </div>`).join('')
+    : '<div style="padding:40px;text-align:center;color:var(--text3);">暂无优化建议</div>';
+}
+
+// ─────────────────────────────────────────────────
+//  ACCOUNT COCKPIT
+// ─────────────────────────────────────────────────
+async function loadAdCockpit() {
+  S.adTrend = null; S.adProjects = []; S.adPromos = [];
+  await loadAdOverview();
+  if (S.adTab === 'trend') loadAdTrend();
+  else if (S.adTab === 'projects') loadAdProjects();
+  else if (S.adTab === 'promotions') loadAdPromotions();
+}
+
+async function loadAdOverview() {
+  const qs = buildQs();
+  document.getElementById('updateTime').textContent = '加载中…';
+  try {
+    const d = await fetch('/api/ad/overview' + qs).then(r=>r.json());
+    S.adOverview = d;
+    document.getElementById('dataDate').textContent = d.end || '--';
+    // Update account filter dropdowns
+    const accOpts = (d.accounts||[]).map(a=>`<option value="${a.account_id}">${a.account_name}</option>`).join('');
+    ['trendAccountFilter','projAccountFilter','promoAccountFilter'].forEach(id=>{
+      const el = document.getElementById(id);
+      if (el) el.innerHTML = (id==='trendAccountFilter'?'<option value="">全部账户（合计）</option>':'<option value="">全部账户</option>') + accOpts;
+    });
+    renderAdGlobalKPI(d);
+    renderAdPieChart(d);
+    renderAdAccountTable(d);
+    document.getElementById('updateTime').textContent = '更新 ' + new Date().toLocaleTimeString('zh-CN');
+  } catch(e) {
+    document.getElementById('updateTime').textContent = '加载失败: '+e.message;
+  }
+}
+
+function renderAdGlobalKPI(d) {
+  const g = d.global || {};
+  const cards = [
+    {label:'总消耗', value:F.money(g.cost), sub:`${d.start||''} ~ ${d.end||''}`, color:'#38bdf8'},
+    {label:'总展示', value:F.num(g.show), sub:'曝光量', color:'#a78bfa'},
+    {label:'总点击', value:F.num(g.click), sub:'CTR '+F.pct(g.ctr), color:'#60a5fa'},
+    {label:'总线索', value:F.num(g.clue), sub:'CPA/线索 '+F.cpa(g.cpa_clue), color:'var(--emerald)'},
+    {label:'总咨询', value:F.num(g.consult), sub:'CPA/咨询 '+F.cpa(g.cpa_consult), color:'var(--amber)'},
+    {label:'总转化', value:F.num(g.convert), sub:'全周期转化', color:'var(--cyan)'},
+    {label:'活跃账户', value:g.active_accounts||0, sub:'有投放', color:'#94a3b8'},
+    {label:'统计天数', value:g.days||0, sub:'统计日数', color:'#64748b'},
+  ];
+  document.getElementById('adGlobalKpi').innerHTML = cards.map(c=>
+    `<div class="kpi-card"><div class="kpi-label">${c.label}</div><div class="kpi-value" style="color:${c.color}">${c.value}</div><div class="kpi-sub">${c.sub}</div></div>`
+  ).join('');
+}
+
+function renderAdPieChart(d) {
+  const accounts = d.accounts||[];
+  const el = document.getElementById('adPieChart');
+  if (!el || typeof echarts==='undefined') return;
+  if (S.charts.pie) S.charts.pie.dispose();
+  S.charts.pie = echarts.init(el);
+  const top10 = accounts.slice(0,12);
+  S.charts.pie.setOption({
+    backgroundColor:'transparent',
+    tooltip:{trigger:'item',formatter:p=>`${p.name}<br/>消耗: ${F.money(p.value)}<br/>占比: ${p.percent}%`},
+    series:[{
+      type:'pie', radius:['35%','70%'], center:['50%','45%'],
+      data:top10.map(a=>({name:a.account_name, value:a.cost})),
+      label:{color:'#94a3b8',fontSize:11},
+      itemStyle:{borderColor:'rgba(6,9,24,.8)',borderWidth:2},
+    }]
+  });
+}
+
+function renderAdAccountTable(d) {
+  const accounts = d.accounts||[];
+  const totalCost = d.global?.cost||1;
+  let html = '<table><thead><tr><th>#</th><th>账户名</th><th>消耗</th><th>消耗占比</th><th>线索</th><th>咨询</th><th>转化</th><th>CTR</th><th>CPA/线索</th><th>CPA/咨询</th><th>活跃天</th></tr></thead><tbody>';
+  accounts.forEach((a,i) => {
+    const bar = `<div class="cost-bar"><div class="cost-bar-bg"><div class="cost-bar-fill" style="width:${Math.min(a.cost_share,100)}%"></div></div><span style="font-size:10px;color:var(--text3);white-space:nowrap;">${a.cost_share}%</span></div>`;
+    const cpaCls = a.cpa_clue>0 && a.cpa_clue<100 ? 'good' : (a.cpa_clue>300?'bad':'');
+    html += `<tr>
+      <td>${i+1}</td><td style="font-weight:600;">${a.account_name}</td>
+      <td>${F.money(a.cost)}</td><td>${bar}</td>
+      <td>${F.num(a.clue)}</td><td>${F.num(a.consult)}</td><td>${F.num(a.convert)}</td>
+      <td>${F.pct(a.ctr)}</td>
+      <td class="${cpaCls}">${F.cpa(a.cpa_clue)}</td>
+      <td>${F.cpa(a.cpa_consult)}</td>
+      <td>${a.active_days}</td>
+    </tr>`;
+  });
+  document.getElementById('adAccountList').innerHTML = html + '</tbody></table>';
+}
+
+// Trend
+async function loadAdTrend() {
+  const accountId = document.getElementById('trendAccountFilter')?.value||'';
+  const qs = buildQs({account_id:accountId, start_date: getDateParams().start||offsetDate((S.adOverview?.end||todayBJ()),-(13)), end_date: getDateParams().end });
+  try {
+    const d = await fetch('/api/ad/trend' + qs).then(r=>r.json());
+    S.adTrend = d;
+    renderAdCostTrend(d);
+    renderAdClueTrend(d);
+    renderAdCtrTrend(d);
+  } catch(e) { console.error('trend load failed', e); }
+}
+
+function makeTrendChart(elId, seriesArr, legend, yFmt) {
+  const el = document.getElementById(elId);
+  if (!el || typeof echarts==='undefined') return;
+  if (S.charts[elId]) S.charts[elId].dispose();
+  S.charts[elId] = echarts.init(el);
+  S.charts[elId].setOption({
+    backgroundColor:'transparent',
+    tooltip:{trigger:'axis',backgroundColor:'rgba(10,15,41,.95)',borderColor:'rgba(0,212,255,.2)',textStyle:{color:'#e2e8f0',fontSize:12}},
+    legend:legend?{data:legend,bottom:0,textStyle:{color:'#94a3b8',fontSize:11}}:undefined,
+    grid:{left:60,right:20,top:16,bottom:legend?40:20},
+    xAxis:{type:'category',axisLabel:{color:'#94a3b8',fontSize:11},axisLine:{lineStyle:{color:'rgba(255,255,255,.1)'}},splitLine:{lineStyle:{color:'rgba(255,255,255,.04)'}}},
+    yAxis:{type:'value',axisLabel:{color:'#94a3b8',fontSize:11,formatter:yFmt||null},splitLine:{lineStyle:{color:'rgba(255,255,255,.04)'}}},
+    series:seriesArr
+  });
+}
+
+function renderAdCostTrend(d) {
+  const trend = d.trend||[];
+  const dates = trend.map(r=>r.date);
+  const isMultiAcc = !document.getElementById('trendAccountFilter')?.value;
+  let series;
+  if (isMultiAcc && (d.stacked||[]).length>1) {
+    // Stacked bar by account
+    const stacked = d.stacked.slice(0,12);
+    const palette = ['#00d4ff','#a78bfa','#f59e0b','#10b981','#f43f5e','#60a5fa','#34d399','#fb923c','#818cf8','#e879f9','#38bdf8','#4ade80'];
+    series = stacked.map((s,i) => ({
+      name:s.name, type:'bar', stack:'cost',
+      data:dates.map(dt=>{ const r=s.data.find(x=>x.date===dt); return r?r.cost:0; }),
+      itemStyle:{color:palette[i%palette.length],opacity:.85},
+    }));
+  } else {
+    series = [{type:'line',smooth:true,data:dates.map((_,i)=>trend[i]?.cost||0),
+      areaStyle:{opacity:.15},lineStyle:{color:'#00d4ff',width:2},itemStyle:{color:'#00d4ff'}}];
+  }
+  const el = document.getElementById('adCostTrendChart');
+  if (!el || typeof echarts==='undefined') return;
+  if (S.charts.adCostTrendChart) S.charts.adCostTrendChart.dispose();
+  S.charts.adCostTrendChart = echarts.init(el);
+  S.charts.adCostTrendChart.setOption({
+    backgroundColor:'transparent',
+    tooltip:{trigger:'axis',backgroundColor:'rgba(10,15,41,.95)',borderColor:'rgba(0,212,255,.2)',textStyle:{color:'#e2e8f0',fontSize:12},
+      formatter:params=>{ let s=params[0]?.axisValue+'<br/>'; params.forEach(p=>s+=`${p.marker}${p.seriesName}: ${F.money(p.value)}<br/>`); return s; }},
+    legend:series.length>1?{data:series.map(s=>s.name),bottom:0,textStyle:{color:'#94a3b8',fontSize:11}}:undefined,
+    grid:{left:65,right:20,top:16,bottom:series.length>1?50:20},
+    xAxis:{type:'category',data:dates,axisLabel:{color:'#94a3b8',fontSize:11,rotate:dates.length>14?30:0},axisLine:{lineStyle:{color:'rgba(255,255,255,.1)'}},splitLine:{lineStyle:{color:'rgba(255,255,255,.04)'}}},
+    yAxis:{type:'value',axisLabel:{color:'#94a3b8',fontSize:11,formatter:v=>F.money(v)},splitLine:{lineStyle:{color:'rgba(255,255,255,.04)'}}},
+    series
+  });
+}
+
+function renderAdClueTrend(d) {
+  const trend = d.trend||[];
+  const dates = trend.map(r=>r.date);
+  makeTrendChart('adClueTrendChart', [{
+    type:'bar',data:trend.map(r=>r.clue||0),
+    itemStyle:{color:'#10b981',opacity:.85},
+    label:{show:true,position:'top',color:'#94a3b8',fontSize:10,formatter:p=>p.value||''},
+  }], null, null);
+  const ch = S.charts['adClueTrendChart'];
+  if (ch) ch.setOption({xAxis:{data:dates}});
+}
+
+function renderAdCtrTrend(d) {
+  const trend = d.trend||[];
+  const dates = trend.map(r=>r.date);
+  makeTrendChart('adCtrTrendChart', [{
+    type:'line',smooth:true,data:trend.map(r=>r.ctr||0),
+    areaStyle:{opacity:.1},lineStyle:{color:'#f59e0b',width:2},itemStyle:{color:'#f59e0b'},
+    label:{show:false},
+  }], null, v=>v.toFixed(2)+'%');
+  const ch = S.charts['adCtrTrendChart'];
+  if (ch) ch.setOption({xAxis:{data:dates}});
+}
+
+// Projects
+let projSortCol='cost', projSortDir='desc', projData=[];
+async function loadAdProjects() {
+  const accountId = document.getElementById('projAccountFilter')?.value||'';
+  const qs = buildQs({account_id:accountId});
+  try {
+    const d = await fetch('/api/ad/projects' + qs).then(r=>r.json());
+    projData = d.projects||[];
+    S.adProjects = projData;
+    renderProjTable(projData);
+  } catch(e) { console.error('projects load failed', e); }
+}
+
+function renderProjTable(data) {
+  document.getElementById('projCount').textContent = '共'+data.length+'个项目';
+  if (!data.length) { document.getElementById('projectTable').innerHTML='<div style="padding:40px;text-align:center;color:var(--text3);">暂无数据</div>'; return; }
+  const cols = [
+    {k:'project_name',l:'项目名称'},{k:'account_name',l:'账户'},
+    {k:'cost',l:'消耗'},{k:'clue',l:'线索'},{k:'consult',l:'咨询'},
+    {k:'convert',l:'转化'},{k:'ctr',l:'CTR'},
+    {k:'cpa_clue',l:'CPA/线索'},{k:'cpa_consult',l:'CPA/咨询'},
+    {k:'promo_count',l:'单元数'},{k:'active_days',l:'活跃天'},
+  ];
+  let html = '<table><thead><tr>' + cols.map(c=>
+    `<th data-sort="${c.k}" onclick="sortProj('${c.k}')" class="${projSortCol===c.k?'sorted':''}">${c.l}<span class="sort-indicator">${projSortCol===c.k?(projSortDir==='asc'?'↑':'↓'):'↕'}</span></th>`
+  ).join('') + '</tr></thead><tbody>';
+  data.forEach(p => {
+    const cpaCls = p.cpa_clue>0 && p.cpa_clue<100 ? 'good' : (p.cpa_clue>300?'bad':'');
+    html += `<tr>
+      <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;" title="${p.project_name}">${p.project_name}</td>
+      <td>${p.account_name}</td>
+      <td>${F.money(p.cost)}</td><td>${p.clue}</td><td>${p.consult}</td><td>${p.convert}</td>
+      <td>${F.pct(p.ctr)}</td>
+      <td class="${cpaCls}">${F.cpa(p.cpa_clue)}</td>
+      <td>${F.cpa(p.cpa_consult)}</td>
+      <td>${p.promo_count}</td><td>${p.active_days}</td>
+    </tr>`;
+  });
+  document.getElementById('projectTable').innerHTML = html + '</tbody></table>';
+}
+
+function sortProj(col) {
+  if (projSortCol===col) projSortDir=projSortDir==='asc'?'desc':'asc';
+  else { projSortCol=col; projSortDir=col==='project_name'?'asc':'desc'; }
+  const dir = projSortDir==='asc'?1:-1;
+  const sorted = [...projData].sort((a,b)=>{
+    let va=a[col],vb=b[col];
+    if (typeof va==='string') return va.localeCompare(vb)*dir;
+    return ((va||0)-(vb||0))*dir;
+  });
+  renderProjTable(sorted);
+}
+
+// Promotions
+let promoData=[], promoSortColG='cost', promoSortDirG='desc';
+async function loadAdPromotions() {
+  const accountId = document.getElementById('promoAccountFilter')?.value||'';
+  const qs = buildQs({account_id:accountId, limit:100});
+  try {
+    const d = await fetch('/api/ad/promotions' + qs).then(r=>r.json());
+    promoData = d.promotions||[];
+    S.adPromos = promoData;
+    filterPromoTable();
+  } catch(e) { console.error('promotions load failed', e); }
+}
+
+function filterPromoTable() {
+  const search = document.getElementById('promoSearch')?.value.toLowerCase()||'';
+  let f = promoData;
+  if (search) f = f.filter(p=>(p.promotion_name||'').toLowerCase().includes(search)||(p.project_name||'').toLowerCase().includes(search));
+  renderPromoTable(f);
+}
+
+function renderPromoTable(data) {
+  document.getElementById('promoCount').textContent = '共'+data.length+'条';
+  if (!data.length) { document.getElementById('promoTable').innerHTML='<div style="padding:40px;text-align:center;color:var(--text3);">暂无数据</div>'; return; }
+  const cols = [
+    {k:'promotion_name',l:'单元名称'},{k:'project_name',l:'所属项目'},{k:'account_name',l:'账户'},
+    {k:'cost',l:'消耗'},{k:'clue',l:'线索'},{k:'consult',l:'咨询'},{k:'convert',l:'转化'},
+    {k:'ctr',l:'CTR'},{k:'cpa_clue',l:'CPA/线索'},{k:'cpa_consult',l:'CPA/咨询'},{k:'active_days',l:'天数'},
+  ];
+  let html = '<table><thead><tr>' + cols.map(c=>
+    `<th data-sort="${c.k}" onclick="sortPromo('${c.k}')" class="${promoSortColG===c.k?'sorted':''}">${c.l}<span class="sort-indicator">${promoSortColG===c.k?(promoSortDirG==='asc'?'↑':'↓'):'↕'}</span></th>`
+  ).join('') + '</tr></thead><tbody>';
+  data.forEach(p => {
+    const cpaCls = p.cpa_clue>0 && p.cpa_clue<100 ? 'good' : (p.cpa_clue>300?'bad':'');
+    html += `<tr>
+      <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;" title="${p.promotion_name}">${p.promotion_name||'--'}</td>
+      <td style="max-width:160px;overflow:hidden;text-overflow:ellipsis;" title="${p.project_name}">${p.project_name||'--'}</td>
+      <td>${p.account_name}</td>
+      <td>${F.money(p.cost)}</td><td>${p.clue}</td><td>${p.consult}</td><td>${p.convert}</td>
+      <td>${F.pct(p.ctr)}</td>
+      <td class="${cpaCls}">${F.cpa(p.cpa_clue)}</td>
+      <td>${F.cpa(p.cpa_consult)}</td>
+      <td>${p.active_days}</td>
+    </tr>`;
+  });
+  document.getElementById('promoTable').innerHTML = html + '</tbody></table>';
+}
+
+function sortPromo(col) {
+  if (promoSortColG===col) promoSortDirG=promoSortDirG==='asc'?'desc':'asc';
+  else { promoSortColG=col; promoSortDirG=col==='promotion_name'?'asc':'desc'; }
+  const dir = promoSortDirG==='asc'?1:-1;
+  promoData.sort((a,b)=>{
+    let va=a[col],vb=b[col];
+    if (typeof va==='string') return va.localeCompare(vb)*dir;
+    return ((va||0)-(vb||0))*dir;
+  });
+  filterPromoTable();
+}
+
+// ─────────────────────────────────────────────────
+//  Material Detail Modal
+// ─────────────────────────────────────────────────
+function closeModal() { document.getElementById('matModal').classList.remove('show'); }
+document.getElementById('matModal').addEventListener('click', e => { if (e.target===e.currentTarget) closeModal(); });
+
+async function showMaterialDetail(materialId) {
+  document.getElementById('matModal').classList.add('show');
+  document.getElementById('matModalFields').innerHTML = '<div style="padding:10px;color:var(--text3);">加载中…</div>';
+  document.getElementById('matModalDaily').innerHTML = '';
+  try {
+    const qs = buildQs();
+    const d = await fetch('/api/material/'+materialId+qs).then(r=>r.json());
+    document.getElementById('matModalTitle').textContent = '素材详情 · '+(d.material_name||'').slice(0,40);
+    document.getElementById('matModalFields').innerHTML = `
+      <div style="padding:8px;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.2);border-radius:6px;font-size:11px;color:var(--amber);margin-bottom:8px;">
+        ⚠️ 此「报表素材ID」无法直接在后台视频库搜索，请用素材名称搜索或查看对应推广计划
+      </div>
+      <div class="modal-field"><span class="mf-label">报表ID</span><span class="mf-value" style="font-family:monospace;">${d.material_id} <button onclick="copyText('${d.material_id}')" class="sync-btn" style="padding:1px 6px;font-size:10px;">复制</button></span></div>
+      <div class="modal-field"><span class="mf-label">素材名称</span><span class="mf-value">${d.material_name||'--'} <button onclick="copyText('${(d.material_name||'').replace(/'/g,"\\'")}');" class="sync-btn" style="padding:1px 6px;font-size:10px;">复制</button></span></div>
+      <div class="modal-field"><span class="mf-label">类型</span><span class="mf-value">${d.material_type||'--'}</span></div>
+      <div class="modal-field"><span class="mf-label">总消耗</span><span class="mf-value">${F.money(d.totals.cost)}</span></div>
+      <div class="modal-field"><span class="mf-label">总线索</span><span class="mf-value">${d.totals.clue} (转化成本: ${d.totals.clue>0?F.money(d.totals.cost/d.totals.clue):'--'})</span></div>
+      <div class="modal-field"><span class="mf-label">总咨询</span><span class="mf-value">${d.totals.consult}</span></div>
+    `;
+    if (d.daily?.length) {
+      const first=d.daily[0].date, last=d.daily[d.daily.length-1].date;
+      document.getElementById('matModalDocTitle').textContent = first===last?`${first} 数据`:`${first} ~ ${last} (共${d.daily.length}天)`;
+      let dh='<table><thead><tr><th>日期</th><th>消耗</th><th>展示</th><th>点击</th><th>CTR</th><th>咨询</th><th>线索</th></tr></thead><tbody>';
+      d.daily.forEach(r=>{
+        const cc=r.ctr>=3?'good':r.ctr>=1.5?'mid':'bad';
+        dh+=`<tr><td>${r.date}</td><td>${F.money(r.cost)}</td><td>${F.num(r.show)}</td><td>${F.num(r.click)}</td><td class="${cc}">${F.pct(r.ctr)}</td><td>${r.consult}</td><td>${r.clue}</td></tr>`;
+      });
+      document.getElementById('matModalDaily').innerHTML = dh+'</tbody></table>';
+    }
+  } catch(e) {
+    document.getElementById('matModalFields').innerHTML = '<div style="color:var(--rose);">加载失败: '+e.message+'</div>';
+  }
+}
+
+// ─────────────────────────────────────────────────
+//  Sync
+// ─────────────────────────────────────────────────
+async function pollSyncStatus() {
+  try {
+    const s = await fetch('/api/sync/status').then(r=>r.json());
+    const el = document.getElementById('syncStatus');
+    const btn = document.getElementById('btnSyncNow');
+    if (s.is_syncing) {
+      el.innerHTML = '<span style="color:var(--cyan);">⟳ 同步中…</span>';
+      btn.disabled = true; btn.style.opacity = '.4';
+    } else {
+      btn.disabled = false; btn.style.opacity = '1';
+      if (s.last_sync_time) {
+        const t = s.last_sync_time.slice(11,16);
+        el.innerHTML = s.last_sync_result==='success'
+          ? `<span style="color:var(--emerald);">✓ ${t}</span>`
+          : `<span style="color:var(--rose);" title="${s.last_sync_result}">✗ ${t}</span>`;
+      } else { el.innerHTML = '<span style="color:var(--text3);">未同步</span>'; }
+    }
+  } catch(_) {}
+}
+
+async function triggerSync() {
+  const btn = document.getElementById('btnSyncNow');
+  btn.disabled=true; btn.textContent='同步中…';
+  try {
+    const r = await fetch('/api/sync/trigger',{method:'POST'});
+    const d = await r.json();
+    if (!d.ok) { alert(d.message); btn.disabled=false; btn.textContent='立即同步'; return; }
+    const chk = setInterval(async()=>{
+      const ss = await fetch('/api/sync/status').then(r=>r.json());
+      if (!ss.is_syncing) { clearInterval(chk); btn.disabled=false; btn.textContent='立即同步'; loadCurrentCockpit(); }
+      pollSyncStatus();
+    },2000);
+  } catch(e) { btn.disabled=false; btn.textContent='立即同步'; }
+}
+
+async function triggerBackfill() {
+  if (!confirm('确定要拉取过去30天全部历史数据吗？')) return;
+  const btn = document.getElementById('btnBackfill');
+  btn.disabled=true; btn.textContent='回填中…';
+  try {
+    const r = await fetch('/api/sync/backfill',{method:'POST'});
+    const d = await r.json();
+    if (!d.ok) { alert(d.message); btn.disabled=false; btn.textContent='补历史数据'; return; }
+    const chk = setInterval(async()=>{
+      const ss = await fetch('/api/sync/status').then(r=>r.json());
+      if (!ss.is_syncing) { clearInterval(chk); btn.disabled=false; btn.textContent='补历史数据'; loadCurrentCockpit(); }
+      pollSyncStatus();
+    },3000);
+  } catch(e) { btn.disabled=false; btn.textContent='补历史数据'; }
+}
+
+// ─────────────────────────────────────────────────
+//  Copy
+// ─────────────────────────────────────────────────
+function copyText(text) {
+  if (navigator.clipboard) navigator.clipboard.writeText(text).catch(()=>{});
+  else { const t=document.createElement('textarea'); t.value=text; document.body.appendChild(t); t.select(); document.execCommand('copy'); document.body.removeChild(t); }
+}
+
+// ─────────────────────────────────────────────────
+//  BATTLE LIST COCKPIT
+// ─────────────────────────────────────────────────
+async function loadBattleList() {
+  document.getElementById('updateTime').textContent = '加载作战清单…';
+  try {
+    const qs = buildQs();
+    const d = await fetch('/api/radar/battle' + qs).then(r=>r.json());
+    document.getElementById('battleWindow').textContent = `作战窗口: ${d.window||'--'} | 大盘转化成本 ¥${(d.benchmark?.lead_cpa||0).toFixed(0)} | 总消耗 ¥${F.money(d.benchmark?.cost)}`;
+    document.getElementById('updateTime').textContent = '就绪';
+
+    renderBattleTable('btScaleTable', 'btScaleCount', d.scale_up||[], 'scale_up');
+    renderBattleTable('btCutTable', 'btCutCount', d.cut_down||[], 'cut_down');
+    renderBattleTable('btFatigueTable', 'btFatigueCount', d.fatigue||[], 'fatigue');
+    renderBattleTrapTable('btTrapTable', 'btTrapCount', d.traps||[]);
+    renderBattleTable('btCheckTable', 'btCheckCount', d.check||[], 'check');
+  } catch(e) { console.error('battle load failed', e); document.getElementById('battleWindow').textContent='加载失败: '+e.message; }
+}
+
+function toggleBattleCard(header) {
+  const body = header.nextElementSibling;
+  body.classList.toggle('show');
+  header.querySelector('.battle-toggle').classList.toggle('open');
+}
+
+function renderBattleTable(bodyId, countId, rows, type) {
+  document.getElementById(countId).textContent = rows.length + '条';
+  const body = document.getElementById(bodyId);
+  if (!rows.length) { body.innerHTML = '<div style="padding:10px;color:var(--text3);text-align:center;">暂无</div>'; return; }
+  body.innerHTML = rows.slice(0,20).map(r => {
+    const name = (r.name||r.acc||'').slice(0,35);
+    const acc = (r.acc||r.account_name||'').slice(0,14);
+    const cost = F.money(r.cost);
+    const clue = r.clue||0;
+    const meta = r.impact||r.suggest||r.reason||'';
+    return `<div class="battle-row">
+      <span class="bt-name" title="${(r.name||'').replace(/"/g,'&quot;')}">${name}</span>
+      <span class="bt-acc">${acc}</span>
+      <span class="bt-cost">${cost}</span>
+      <span class="bt-clue">${clue}留资</span>
+      <span class="bt-meta">${meta.slice(0,50)}</span>
+    </div>`;
+  }).join('');
+  body.classList.add('show');
+}
+
+function renderBattleTrapTable(bodyId, countId, rows) {
+  document.getElementById(countId).textContent = rows.length + '条';
+  const body = document.getElementById(bodyId);
+  if (!rows.length) { body.innerHTML = '<div style="padding:10px;color:var(--text3);text-align:center;">暂无陷阱</div>'; return; }
+  body.innerHTML = rows.slice(0,20).map(r => {
+    const name = (r.name||r.acc||'').slice(0,30);
+    const acc = (r.acc||r.account_name||'').slice(0,14);
+    const lcpa = r.lead_cpa||r.clue_cpa||0;
+    const consultCpa = r.consult_cpa||r.cpa||0;
+    const leadRate = r.lead_rate||r.lead_consult_rate||r.lead_conv_rate||0;
+    return `<div class="battle-row">
+      <span class="bt-name" title="${(r.name||'').replace(/"/g,'&quot;')}">${name} <span class="battle-trap-tag">🪤漏</span></span>
+      <span class="bt-acc">${acc}</span>
+      <span class="bt-cost">咨询成本¥${consultCpa.toFixed(0)}</span>
+      <span class="bt-clue">转化成本¥${lcpa.toFixed(0)}</span>
+      <span class="bt-meta">留资率${leadRate.toFixed(0)}% 禁止放量</span>
+    </div>`;
+  }).join('');
+  body.classList.add('show');
+}
+
+// ─────────────────────────────────────────────────
+//  ACCOUNT REPORT COCKPIT
+// ─────────────────────────────────────────────────
+function populateReportAccounts() {
+  // Populate account dropdown from existing ad overview data
+  if (S.adOverview && S.adOverview.accounts && S.adOverview.accounts.length) {
+    const sel = document.getElementById('reportAccountSelect');
+    let opts = '<option value="">-- 请选择账户 --</option>';
+    S.adOverview.accounts.forEach(a => {
+      opts += `<option value="${a.account_id}">${a.account_name}</option>`;
+    });
+    sel.innerHTML = opts;
+    if (S.reportAccountId) {
+      sel.value = S.reportAccountId;
+      loadAccountReport();  // auto-refresh if account already selected
+    }
+    document.getElementById('reportPeriod').textContent = '';
+  } else {
+    // Need to load account list first
+    fetch('/api/ad/overview').then(r=>r.json()).then(d => {
+      S.adOverview = d;
+      populateReportAccounts();
+    }).catch(e => console.error('load accounts failed', e));
+  }
+}
+
+async function loadAccountReport() {
+  const accountId = document.getElementById('reportAccountSelect').value;
+  if (!accountId) {
+    document.getElementById('reportKpiCards').innerHTML = '';
+    document.getElementById('reportProjects').innerHTML = '<div class="empty-hint">选择账户后加载</div>';
+    document.getElementById('reportPromotions').innerHTML = '<div class="empty-hint">选择账户后加载</div>';
+    document.getElementById('reportMaterials').innerHTML = '<div class="empty-hint">选择账户后加载</div>';
+    document.getElementById('btnExportWord').style.display = 'none';
+    if (S.charts.reportTrend) { S.charts.reportTrend.dispose(); S.charts.reportTrend = null; }
+    return;
+  }
+  S.reportAccountId = accountId;
+  document.getElementById('btnExportWord').style.display = 'none';
+  document.getElementById('updateTime').textContent = '加载报告…';
+
+  try {
+    const qs = buildQs();
+    const d = await fetch('/api/account_report/' + accountId + qs).then(r => r.json());
+    S.reportData = d;
+
+    document.getElementById('reportPeriod').textContent = `数据周期: ${d.start} ~ ${d.end}`;
+    document.getElementById('btnExportWord').style.display = '';
+    document.getElementById('updateTime').textContent = '更新 ' + new Date().toLocaleTimeString('zh-CN');
+
+    renderReportKpi(d.kpi);
+    // [DEPRECATED] renderDeliverySplit removed
+    renderReportTrend(d.trend);
+    renderReportProjects(d.projects);
+    renderReportPromotions(d.promotions);
+    renderReportMaterials(d.materials);
+  } catch(e) {
+    console.error('report load failed', e);
+    document.getElementById('updateTime').textContent = '加载失败: ' + e.message;
+  }
+}
+
+function renderReportKpi(kpi) {
+  const cards = [
+    {label:'总消耗', value:F.money(kpi.cost), sub:'', color:'#38bdf8'},
+    {label:'总展示', value:F.num(kpi.show), sub:'曝光量', color:'#a78bfa'},
+    {label:'总点击', value:F.num(kpi.click), sub:'CTR '+F.pct(kpi.ctr), color:'#60a5fa'},
+    {label:'线索(留资)', value:F.num(kpi.clue), sub:'留资率 '+kpi.lead_rate+'%', color:'#34d399'},
+    {label:'总咨询', value:F.num(kpi.consult), sub:'', color:'#f59e0b'},
+    {label:'总转化', value:F.num(kpi.convert), sub:'全周期', color:'#06b6d4'},
+    {label:'转化成本', value:F.cpa(kpi.lead_cost), sub:'消耗÷留资', color:kpi.lead_cost>0&&kpi.lead_cost<100?'#34d399':'#f59e0b'},
+    {label:'咨询成本', value:F.cpa(kpi.consult_cost), sub:'消耗÷咨询', color:'#94a3b8'},
+    {label:'千次展示', value:'¥'+Math.round(kpi.cpm), sub:'CPM', color:'#8b5cf6'},
+    {label:'活跃天数', value:kpi.active_days+'天', sub:'有投放天数', color:'#64748b'},
+  ];
+  document.getElementById('reportKpiCards').innerHTML = cards.map(c =>
+    `<div class="report-kpi-card"><div class="rk-label">${c.label}</div><div class="rk-value" style="color:${c.color}">${c.value}</div><div class="rk-sub">${c.sub}</div></div>`
+  ).join('');
+}
+
+// [DEPRECATED 2026-06-28] renderDeliverySplit 已移除（按 SKILL.md 规范）
+
+function renderReportTrend(trend) {
+  const el = document.getElementById('reportTrendChart');
+  if (!el || typeof echarts === 'undefined') return;
+  if (S.charts.reportTrend) S.charts.reportTrend.dispose();
+  S.charts.reportTrend = echarts.init(el);
+
+  const dates = trend.map(t => t.date);
+  const costs = trend.map(t => t.cost);
+  const clues = trend.map(t => t.clue);
+  const consults = trend.map(t => t.consult);
+
+  S.charts.reportTrend.setOption({
+    backgroundColor: 'transparent',
+    tooltip: { trigger: 'axis' },
+    legend: { data: ['消耗', '线索', '咨询'], textStyle: { color: '#94a3b8' }, top: 0 },
+    grid: { left: 55, right: 55, top: 35, bottom: 30 },
+    xAxis: { type: 'category', data: dates, axisLabel: { color: '#94a3b8', fontSize: 10 } },
+    yAxis: [
+      { type: 'value', name: '消耗(元)', nameTextStyle: { color: '#94a3b8' },
+        axisLabel: { color: '#94a3b8', formatter: v => v >= 1e4 ? (v/1e4).toFixed(1)+'万' : v } },
+      { type: 'value', name: '数量', nameTextStyle: { color: '#94a3b8' },
+        axisLabel: { color: '#94a3b8' } },
+    ],
+    series: [
+      { name: '消耗', type: 'bar', data: costs, itemStyle: { color: '#38bdf8' }, yAxisIndex: 0 },
+      { name: '线索', type: 'line', data: clues, itemStyle: { color: '#34d399' }, yAxisIndex: 1, smooth: true },
+      { name: '咨询', type: 'line', data: consults, itemStyle: { color: '#f59e0b' }, yAxisIndex: 1, smooth: true },
+    ],
+  });
+}
+
+function renderReportProjects(projects) {
+  if (!projects.length) {
+    document.getElementById('reportProjects').innerHTML = '<div class="empty-hint">暂无项目数据</div>';
+    return;
+  }
+  const totalCost = projects.reduce((s,p) => s + p.cost, 0) || 1;
+  let html = '<table class="report-table"><thead><tr><th>#</th><th>项目名称</th><th class="num">消耗</th><th class="num">占比</th><th class="num">线索</th><th class="num">咨询</th><th class="num">转化</th><th class="num">转化成本</th><th class="num">单元数</th></tr></thead><tbody>';
+  projects.forEach((p, i) => {
+    const share = (p.cost / totalCost * 100).toFixed(1);
+    html += `<tr>
+      <td>${i+1}</td><td>${(p.project_name||'').slice(0,35)}</td>
+      <td class="num">${F.money(p.cost)}</td><td class="num">${share}%</td>
+      <td class="num">${F.num(p.clue)}</td><td class="num">${F.num(p.consult)}</td>
+      <td class="num">${F.num(p.convert)}</td><td class="num ${p.lead_cost>0&&p.lead_cost<100?'good':''}">${F.cpa(p.lead_cost)}</td>
+      <td class="num">${p.promo_count}</td>
+    </tr>`;
+  });
+  document.getElementById('reportProjects').innerHTML = html + '</tbody></table>';
+}
+
+function renderReportPromotions(promotions) {
+  if (!promotions.length) {
+    document.getElementById('reportPromotions').innerHTML = '<div class="empty-hint">暂无投放单元数据</div>';
+    return;
+  }
+  let html = '<table class="report-table"><thead><tr><th>#</th><th>单元名称</th><th>所属项目</th><th class="num">消耗</th><th class="num">展示</th><th class="num">点击</th><th class="num">线索</th><th class="num">转化</th><th class="num">转化成本</th></tr></thead><tbody>';
+  promotions.forEach((p, i) => {
+    html += `<tr>
+      <td>${i+1}</td><td title="${(p.promotion_name||'').replace(/"/g,'&quot;')}">${(p.promotion_name||'').slice(0,25)}</td>
+      <td>${(p.project_name||'').slice(0,18)}</td>
+      <td class="num">${F.money(p.cost)}</td><td class="num">${F.num(p.show)}</td>
+      <td class="num">${F.num(p.click)}</td><td class="num">${F.num(p.clue)}</td>
+      <td class="num">${F.num(p.convert)}</td>
+      <td class="num ${p.lead_cost>0&&p.lead_cost<100?'good':''}">${F.cpa(p.lead_cost)}</td>
+    </tr>`;
+  });
+  document.getElementById('reportPromotions').innerHTML = html + '</tbody></table>';
+}
+
+function renderReportMaterials(materials) {
+  if (!materials.length) {
+    document.getElementById('reportMaterials').innerHTML = '<div class="empty-hint">暂无素材数据</div>';
+    return;
+  }
+  let html = '<table class="report-table"><thead><tr><th>#</th><th>素材名称</th><th>类型</th><th class="num">消耗</th><th class="num">展示</th><th class="num">线索</th><th>留资率</th><th class="num">转化成本</th></tr></thead><tbody>';
+  materials.forEach((m, i) => {
+    html += `<tr>
+      <td>${i+1}</td><td title="${(m.material_name||'').replace(/"/g,'&quot;')}">${(m.material_name||'').slice(0,28)}</td>
+      <td>${m.material_type}</td>
+      <td class="num">${F.money(m.cost)}</td><td class="num">${F.num(m.show)}</td>
+      <td class="num">${F.num(m.clue)}</td>
+      <td>${(m.lead_rate||0)}%</td>
+      <td class="num ${m.lead_cost>0&&m.lead_cost<100?'good':''}">${F.cpa(m.lead_cost)}</td>
+    </tr>`;
+  });
+  document.getElementById('reportMaterials').innerHTML = html + '</tbody></table>';
+}
+
+function exportAccountReport() {
+  const accountId = S.reportAccountId;
+  if (!accountId) return;
+  const qs = buildQs();
+  const url = '/api/account_report/' + accountId + '/export' + qs;
+  window.open(url, '_blank');
+}
+
+// ─────────────────────────────────────────────────
+//  Init
+// ─────────────────────────────────────────────────
+loadMaterial();
+pollSyncStatus();
+setInterval(loadCurrentCockpit, 5*60*1000);
+setInterval(pollSyncStatus, 10*1000);
+window.addEventListener('resize', ()=>Object.values(S.charts).forEach(ch=>{try{ch.resize();}catch(_){}}));
+</script>
+</body>
+</html>"""
+
+
+if __name__ == "__main__":
+    start_dashboard(8888, debug=True)
