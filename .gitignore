@@ -20,6 +20,10 @@ venv/
 *.swo
 .DS_Store
 
+# 测试
+.pytest_cache/
+tests/__pycache__/
+
 # 临时代码
 _claude_建议/
 
