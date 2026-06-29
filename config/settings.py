@@ -156,8 +156,10 @@ LOCAL_SUB_ACCOUNTS: dict[str, str] = {
 LOCAL_SUB_ACCOUNT_IDS = list(LOCAL_SUB_ACCOUNTS.values())
 
 # ── Scheduler ─────────────────────────────────────────────────
-SCHEDULE_INTERVAL_MINUTES = 30  # 每30分钟拉取一次数据
-SCHEDULE_INTERVAL_HOURS = 6  # 保留兼容，实际由 SCHEDULE_INTERVAL_MINUTES 控制
+# 定时同步配置（北京时间）
+SCHEDULE_CRON_HOUR = 9       # 每天几点
+SCHEDULE_CRON_MINUTE = 30    # 每天几分
+SCHEDULE_TIMEZONE = 'Asia/Shanghai'  # 北京时间
 
 # ── Alert Channels ────────────────────────────────────────────
 WECOM_WEBHOOK_URL = os.getenv("WECOM_WEBHOOK_URL", "")

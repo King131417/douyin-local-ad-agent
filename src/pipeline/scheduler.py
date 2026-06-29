@@ -10,9 +10,11 @@ import threading
 from datetime import date, datetime
 
 from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.cron import CronTrigger
 
-from config.settings import SCHEDULE_INTERVAL_MINUTES
+import pytz
+
+from config.settings import SCHEDULE_CRON_HOUR, SCHEDULE_CRON_MINUTE, SCHEDULE_TIMEZONE
 from .etl import ETLPipeline
 
 logger = logging.getLogger(__name__)
@@ -74,15 +76,21 @@ class AdDataScheduler:
         """Start the background scheduler."""
         self._scheduler.add_job(
             self._sync_job,
-            trigger=IntervalTrigger(minutes=SCHEDULE_INTERVAL_MINUTES),
+            trigger=CronTrigger(
+                hour=SCHEDULE_CRON_HOUR,
+                minute=SCHEDULE_CRON_MINUTE,
+                timezone=pytz.timezone(SCHEDULE_TIMEZONE)
+            ),
             id="ad_data_sync",
-            name="Ad data sync (every 30 min)",
+            name=f"Ad data sync (daily {SCHEDULE_CRON_HOUR:02d}:{SCHEDULE_CRON_MINUTE:02d} {SCHEDULE_TIMEZONE})",
             replace_existing=True,
         )
         self._scheduler.start()
         logger.info(
-            "Scheduler started: syncing every %d minutes",
-            SCHEDULE_INTERVAL_MINUTES,
+            "Scheduler started: syncing daily at %02d:%02d (%s)",
+            SCHEDULE_CRON_HOUR,
+            SCHEDULE_CRON_MINUTE,
+            SCHEDULE_TIMEZONE,
         )
 
     def stop(self):

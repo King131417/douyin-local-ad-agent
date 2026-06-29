@@ -36,7 +36,7 @@ def _start_scheduler():
     global _scheduler
     _scheduler = AdDataScheduler()
     _scheduler.start()
-    logger.info("Auto-sync scheduler started (every 30 minutes)")
+    logger.info("Auto-sync scheduler started (daily 9:30 AM Beijing time)")
     _scheduler.trigger_now()
 
 
