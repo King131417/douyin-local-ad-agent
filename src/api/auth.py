@@ -190,9 +190,11 @@ class AuthManager:
         self._access_token = result["access_token"]
         self._refresh_token = result.get("refresh_token")
         self._expires_at = time.time() + result.get("expires_in", 86400)
-        self._advertiser_ids = [
-            str(adv["advertiser_id"]) for adv in result.get("advertiser_ids", [])
-        ]
+        raw_ids = result.get("advertiser_ids", [])
+        if raw_ids and isinstance(raw_ids[0], dict):
+            self._advertiser_ids = [str(adv["advertiser_id"]) for adv in raw_ids]
+        else:
+            self._advertiser_ids = [str(aid) for aid in raw_ids]
         self._save_token_cache()
         logger.info(
             "Auth code exchanged. Token expires in %ds, %d advertisers authorized.",

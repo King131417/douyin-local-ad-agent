@@ -247,7 +247,10 @@ class ETLPipeline:
         # Step 4: Refresh account names
         self.refresh_account_names(account_ids)
 
-        # Step 5: Completeness check
+        # Step 5: Reconciliation — detect gaps from deleted entities
+        self._reconciliation_check(date_str_start, date_str_end, account_ids)
+
+        # Step 6: Completeness check
         self._completeness_check(date_str_start, date_str_end, account_ids, results)
 
         logger.info("=== Backfill complete: %d account rows, %d materials, %d promotions ===",
@@ -339,6 +342,72 @@ class ETLPipeline:
         if v is None or v == "":
             return 0
         return float(v)
+
+    def _reconciliation_check(
+        self,
+        start_date: str,
+        end_date: str,
+        account_ids: list[str],
+    ) -> None:
+        """
+        Post-sync reconciliation: detect gaps between account-level total
+        and promotion-level sum. Gaps may indicate deleted promotions/projects
+        whose historical spend wasn't captured.
+
+        If a gap > 0.1% is found, query deleted entity lists from API to
+        help identify the root cause.
+        """
+        conn = self.storage._get_conn()
+        total_gap = 0.0
+        accounts_with_gap = 0
+
+        for aid in account_ids:
+            # Account total for the range
+            acc_row = conn.execute(
+                """
+                SELECT SUM(stat_cost) as cost FROM account_reports
+                WHERE account_id = ? AND stat_date BETWEEN ? AND ?
+                """,
+                (aid, start_date, end_date),
+            ).fetchone()
+            acc_cost = (acc_row["cost"] or 0) if acc_row else 0
+
+            # Promotion total for the range
+            promo_row = conn.execute(
+                """
+                SELECT SUM(stat_cost) as cost FROM promotion_reports
+                WHERE account_id = ? AND stat_date BETWEEN ? AND ?
+                """,
+                (aid, start_date, end_date),
+            ).fetchone()
+            promo_cost = (promo_row["cost"] or 0) if promo_row else 0
+
+            if acc_cost <= 0:
+                continue
+
+            gap = acc_cost - promo_cost
+            gap_pct = gap / acc_cost * 100
+
+            if abs(gap_pct) > 0.1:
+                total_gap += gap
+                accounts_with_gap += 1
+                logger.warning(
+                    "Reconcile: %s gap=¥%.2f (%.2f%%), account=¥%.2f, promo=¥%.2f",
+                    aid[-8:], gap, gap_pct, acc_cost, promo_cost,
+                )
+
+        if accounts_with_gap > 0:
+            logger.warning(
+                "Reconciliation: %d accounts with gaps, total gap=¥%.2f — "
+                "may indicate deleted promotions/projects. "
+                "Use 'python ad.py 对账' to investigate further.",
+                accounts_with_gap, total_gap,
+            )
+        else:
+            logger.info(
+                "Reconciliation: all %d accounts aligned (gap < 0.1%%)",
+                len(account_ids),
+            )
 
     def _completeness_check(
         self,

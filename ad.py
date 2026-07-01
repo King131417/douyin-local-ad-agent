@@ -20,6 +20,7 @@ Usage:
   python ad.py 项目 01成都三老板    # 项目级分析 (消耗/转化按项目聚合)
   python ad.py 单元 01成都三老板    # 投放单元级分析
   python ad.py 账户列表           # 列出所有子账户及最新状态
+  python ad.py 对账              # 对账检查: 账户总消耗 vs 单元消耗, 检测已删除实体缺口
 """
 
 import argparse
@@ -590,6 +591,111 @@ def cmd_accounts_list(args):
     print()
 
 
+def cmd_reconcile(args):
+    """对账检查: 账户总消耗 vs 单元消耗, 检测已删除实体缺口."""
+    from config.settings import LOCAL_SUB_ACCOUNTS
+    from src.api.client import OceanEngineClient
+    from src.api.auth import AuthManager
+
+    conn = _get_conn()
+    latest = _latest_date()
+    print(f"\n  对账检查 | 日期范围: 2026-06-01 ~ {latest}")
+    print(f"  {'─' * 70}")
+
+    total_gap = 0.0
+    total_account_cost = 0.0
+    accounts_with_gap = 0
+    details = []
+
+    for name, aid in LOCAL_SUB_ACCOUNTS.items():
+        # DB 中的账户消耗
+        acc_row = conn.execute(
+            "SELECT SUM(stat_cost) as cost FROM account_reports "
+            "WHERE account_id = ? AND stat_date BETWEEN '2026-06-01' AND ?",
+            (aid, latest),
+        ).fetchone()
+        acc_cost = (acc_row["cost"] or 0) if acc_row else 0
+
+        # DB 中的单元消耗
+        promo_row = conn.execute(
+            "SELECT SUM(stat_cost) as cost FROM promotion_reports "
+            "WHERE account_id = ? AND stat_date BETWEEN '2026-06-01' AND ?",
+            (aid, latest),
+        ).fetchone()
+        promo_cost = (promo_row["cost"] or 0) if promo_row else 0
+
+        if acc_cost <= 0:
+            continue
+
+        total_account_cost += acc_cost
+        gap = acc_cost - promo_cost
+
+        if abs(gap) > 0.01:
+            accounts_with_gap += 1
+            total_gap += gap
+            gap_pct = gap / acc_cost * 100
+            details.append((name, aid, acc_cost, promo_cost, gap, gap_pct))
+
+    conn.close()
+
+    if accounts_with_gap:
+        print(f"\n  ⚠️  发现 {accounts_with_gap} 个账户存在差异:")
+        print(f"  {'─' * 80}")
+        print(f"  {'账户':<22} | {'账户总消耗':>12} | {'单元总消耗':>12} | {'差异':>10} | %")
+        print(f"  {'─' * 80}")
+        for name, aid, acc, promo, gap, pct in sorted(details, key=lambda x: abs(x[5]), reverse=True):
+            short = name[:20]
+            print(f"  {short:<22} | ¥{acc:>11,.2f} | ¥{promo:>11,.2f} | ¥{gap:>9,.2f} | {pct:+.2f}%")
+        print(f"  {'─' * 80}")
+        print(f"  总差异: ¥{total_gap:,.2f} ({total_gap/total_account_cost*100:+.4f}%)")
+        print(f"\n  💡 差异可能原因: 已删除的投放单元/项目有历史消耗但未在单元报表中体现。")
+        print(f"  建议: 运行 'python ad.py 同步' 重新拉取最新数据。")
+    else:
+        print(f"  ✅ 所有 {len(LOCAL_SUB_ACCOUNTS)} 个账户完全对齐 (差异 < 0.01元)")
+        print(f"  总消耗: ¥{total_account_cost:,.2f}")
+
+    # 额外：检查是否有已删除实体
+    print(f"\n  正在检查已删除的投放单元...")
+    try:
+        auth = AuthManager()
+        client = OceanEngineClient(auth)
+        total_deleted_promos = 0
+        total_deleted_projects = 0
+
+        for name, aid in LOCAL_SUB_ACCOUNTS.items():
+            # 仅已删除的单元
+            try:
+                del_promos = client.get_promotion_list(
+                    aid, status_filter="PROMOTION_STATUS_DELETED",
+                )
+                if del_promos:
+                    total_deleted_promos += len(del_promos)
+                    for dp in del_promos[:3]:
+                        print(f"    [已删除单元] {dp.get('promotion_name','')[:25]}  ID={dp.get('promotion_id')}")
+            except Exception:
+                pass
+
+            # 仅已删除的项目
+            try:
+                del_projs = client.get_project_list(
+                    aid, status_filter="PROJECT_STATUS_DELETED",
+                )
+                if del_projs:
+                    total_deleted_projects += len(del_projs)
+                    for dp in del_projs[:3]:
+                        print(f"    [已删除项目] {dp.get('project_name','')[:25]}  ID={dp.get('project_id')}")
+            except Exception:
+                pass
+
+        print(f"\n  已删除单元: {total_deleted_promos} 个 | 已删除项目: {total_deleted_projects} 个")
+        if total_deleted_promos == 0 and total_deleted_projects == 0:
+            print(f"  ✅ 当前无已删除实体，数据完整")
+    except Exception as e:
+        print(f"  ⚠️  无法检查已删除实体: {e}")
+
+    print()
+
+
 # ── CLI ────────────────────────────────────────────────────
 
 COMMAND_MAP = {
@@ -607,6 +713,7 @@ COMMAND_MAP = {
     "项目":      (cmd_projects,       "项目级分析"),
     "单元":      (cmd_promotions,     "投放单元级分析"),
     "账户列表":   (cmd_accounts_list,  "列出所有子账户"),
+    "对账":      (cmd_reconcile,     "对账检查: 检测已删除实体缺口"),
 }
 
 

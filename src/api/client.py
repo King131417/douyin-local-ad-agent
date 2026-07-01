@@ -499,17 +499,34 @@ class OceanEngineClient:
         self,
         account_id: str,
         page_size: int = 50,
+        status_filter: str | None = None,
     ) -> list[dict]:
-        """Get promotion (投放计划) list for a local account."""
+        """
+        Get promotion (投放单元) list for a local account.
+
+        Args:
+            account_id: Local ad account ID.
+            page_size: Items per page.
+            status_filter: Promotion status filter. One of:
+                - None (default): Only non-deleted promotions.
+                - 'PROMOTION_STATUS_ALL': All promotions including deleted.
+                - 'PROMOTION_STATUS_DELETED': Only deleted promotions.
+        """
         all_items: list[dict] = []
         page = 1
 
         while True:
-            result = self._get("/local/promotion/list/", {
+            params: dict = {
                 "local_account_id": int(account_id),
                 "page": page,
                 "page_size": page_size,
-            })
+            }
+            if status_filter:
+                params["filtering"] = json.dumps(
+                    {"promotion_status_first": status_filter}
+                )
+
+            result = self._get("/local/promotion/list/", params)
 
             if result.get("code") != 0:
                 if page == 1:
@@ -528,6 +545,196 @@ class OceanEngineClient:
                 break
 
         return all_items
+
+    # ── Project List ───────────────────────────────────────────
+
+    def get_project_list(
+        self,
+        account_id: str,
+        page_size: int = 50,
+        status_filter: str | None = None,
+    ) -> list[dict]:
+        """
+        Get project (项目) list for a local account.
+
+        Args:
+            account_id: Local ad account ID.
+            page_size: Items per page.
+            status_filter: Project status filter. One of:
+                - None (default): Only non-deleted projects.
+                - 'PROJECT_STATUS_ALL': All projects including deleted.
+                - 'PROJECT_STATUS_DELETED': Only deleted projects.
+        """
+        all_items: list[dict] = []
+        page = 1
+
+        while True:
+            params: dict = {
+                "local_account_id": int(account_id),
+                "page": page,
+                "page_size": page_size,
+            }
+            if status_filter:
+                params["filtering"] = json.dumps(
+                    {"project_status_first": status_filter}
+                )
+
+            result = self._get("/local/project/list/", params)
+
+            if result.get("code") != 0:
+                if page == 1:
+                    raise RuntimeError(
+                        f"Project list failed: {result.get('message', result)}"
+                    )
+                break
+
+            rows = result.get("data", {}).get("list", [])
+            if not rows:
+                break
+
+            all_items.extend(rows)
+            page += 1
+            if len(rows) < page_size:
+                break
+
+        return all_items
+
+    # ── Project-Level Report ───────────────────────────────────
+
+    def get_project_report(
+        self,
+        account_id: str,
+        start_date: str,
+        end_date: str,
+        metrics: list[str] | None = None,
+        dimensions: list[str] | None = None,
+        page_size: int = 50,
+    ) -> list[dict]:
+        """
+        Get project-level report.
+
+        Uses: GET /v3.0/local/report/project/get/
+        Returns data for ALL projects with spend in the date range,
+        including deleted projects (history is preserved).
+        """
+        metrics = metrics or LOCAL_PROMOTION_METRICS
+        dimensions = dimensions or [
+            "stat_datetime", "project_id", "project_name",
+        ]
+
+        all_rows: list[dict] = []
+        page = 1
+
+        while True:
+            result = self._get("/local/report/project/get/", {
+                "local_account_id": int(account_id),
+                "start_date": start_date,
+                "end_date": end_date,
+                "page": page,
+                "page_size": page_size,
+                "metrics": metrics,
+                "dimensions": dimensions,
+            })
+
+            if result.get("code") != 0:
+                if page == 1:
+                    raise RuntimeError(
+                        f"Project report failed: {result.get('message', result)}"
+                    )
+                break
+
+            # Project report uses "project_list" key
+            rows = result.get("data", {}).get("project_list", [])
+            if not rows:
+                break
+
+            all_rows.extend(rows)
+            page += 1
+
+            if len(rows) < page_size:
+                break
+
+        return all_rows
+
+    # ── Reconciliation ─────────────────────────────────────────
+
+    def reconcile_deleted_entities(
+        self,
+        account_id: str,
+        start_date: str,
+        end_date: str,
+    ) -> dict:
+        """
+        Reconcile account total vs promotion-level sum to detect gaps
+        caused by deleted promotions/projects.
+
+        Returns:
+            {
+                "account_total": float,
+                "promotion_total": float,
+                "gap": float,
+                "gap_pct": float,
+                "deleted_promotion_ids": [...],
+                "deleted_project_ids": [...],
+            }
+        """
+        result: dict = {
+            "account_total": 0.0,
+            "promotion_total": 0.0,
+            "gap": 0.0,
+            "gap_pct": 0.0,
+            "deleted_promotion_ids": [],
+            "deleted_project_ids": [],
+        }
+
+        # 1. Get account-level total
+        acc_rows = self.get_account_report(
+            account_id, start_date, end_date, page_size=100,
+        )
+        result["account_total"] = sum(
+            r.get("stat_cost", 0) for r in acc_rows
+        )
+
+        # 2. Get promotion-level total (already includes deleted entities with spend)
+        promo_rows = self.get_promotion_report(
+            account_id, start_date, end_date, page_size=100,
+        )
+        result["promotion_total"] = sum(
+            r.get("stat_cost", 0) for r in promo_rows
+        )
+
+        # 3. Calculate gap
+        result["gap"] = result["account_total"] - result["promotion_total"]
+        if result["account_total"] > 0:
+            result["gap_pct"] = result["gap"] / result["account_total"] * 100
+
+        # 4. If gap exists, check deleted promotions/projects
+        if abs(result["gap_pct"]) > 0.1:
+            # Fetch deleted promotions
+            try:
+                del_promos = self.get_promotion_list(
+                    account_id,
+                    status_filter="PROMOTION_STATUS_DELETED",
+                )
+                result["deleted_promotion_ids"] = [
+                    p["promotion_id"] for p in del_promos
+                ]
+            except Exception:
+                pass
+
+            # Fetch deleted projects
+            try:
+                del_projects = self.get_project_list(
+                    account_id,
+                    status_filter="PROJECT_STATUS_DELETED",
+                )
+                result["deleted_project_ids"] = [
+                    p["project_id"] for p in del_projects
+                ]
+            except Exception:
+                pass
+
+        return result
 
     # ── Clue Data ─────────────────────────────────────────────
 
