@@ -31,12 +31,32 @@ LOCAL_ACCOUNT_METRICS = [
     "show_cnt",            # 展示量
     "click_cnt",           # 点击量
     "ctr",                 # 点击率
+    "cpc_platform",        # 点击均价（API 原生，不用手算）
+    "cpm_platform",        # 千次展示费用（API 原生）
     "convert_cnt",         # 转化数
+    "conversion_cost",     # 转化成本（API 原生）
+    "conversion_rate",     # 转化率（API 原生）
     "message_action_cnt",  # 私信咨询数
     "clue_message_count",  # 私信留资数
     "phone_confirm_cnt",   # 电话拨打数
     "phone_connect_cnt",   # 电话接通数
     "clue_pay_order_cnt",  # 团购线索数
+    "form_cnt",            # 表单提交数
+]
+
+# Extended metrics for video quality analysis
+LOCAL_VIDEO_METRICS = [
+    "total_play",          # 视频播放次数
+    "play_duration_3s",    # 3s播放
+    "play_over",           # 完播次数
+    "play_over_rate",      # 完播率
+    "dy_like",             # 点赞
+    "dy_comment",          # 评论
+    "dy_share",            # 分享
+    "dy_collect",          # 收藏
+    "dy_follow",           # 新增粉丝
+    "dy_home_visited",     # 主页访问
+    "poi_recommend_count", # 浏览商户人数
 ]
 
 # Promotion-level metrics (subset of the above + promotion dimensions)
@@ -45,13 +65,17 @@ LOCAL_PROMOTION_METRICS = [
     "show_cnt",
     "click_cnt",
     "ctr",
+    "cpc_platform",
+    "cpm_platform",
     "convert_cnt",
+    "conversion_cost",
+    "conversion_rate",
     "message_action_cnt",
     "clue_message_count",
 ]
 
 LOCAL_PROMOTION_DIMENSIONS = [
-    "stat_datetime",
+    "stat_time_day",
     "promotion_id",
     "promotion_name",
     "promotion_status",
@@ -335,16 +359,17 @@ class OceanEngineClient:
         start_date: str,
         end_date: str,
         metrics: list[str] | None = None,
-        dimensions: list[str] | None = None,
         page_size: int = 50,
     ) -> list[dict]:
         """
         Get promotion-level report (drilled down by promotion/project).
 
         Uses: GET /v3.0/local/report/promotion/get/
+
+        Note: dimensions (promotion_id, project_id, stat_time_day, etc.)
+        are automatically returned by the API — no "dimensions" param needed.
         """
         metrics = metrics or LOCAL_PROMOTION_METRICS
-        dimensions = dimensions or LOCAL_PROMOTION_DIMENSIONS
 
         all_rows: list[dict] = []
         page = 1
@@ -357,7 +382,6 @@ class OceanEngineClient:
                 "page": page,
                 "page_size": page_size,
                 "metrics": metrics,
-                "dimensions": dimensions,
             })
 
             if result.get("code") != 0:
@@ -389,11 +413,17 @@ class OceanEngineClient:
         end_date: str,
         metrics: list[str] | None = None,
         page_size: int = 50,
+        promotion_ids: list[str] | None = None,
     ) -> list[dict]:
         """
         Get material-level (creative) report.
 
         Uses: GET /v3.0/local/report/material/get/
+
+        Args:
+            promotion_ids: Optional list of promotion IDs to filter by.
+                When provided, only returns materials used in those promotions.
+                This enables material→promotion linkage (SDK v1.34.1 new feature).
 
         Returns list of material rows with: material_id, material_name,
         material_type, stat_cost, show_cnt, click_cnt, ctr, convert_cnt,
@@ -405,14 +435,22 @@ class OceanEngineClient:
         page = 1
 
         while True:
-            result = self._get("/local/report/material/get/", {
+            params: dict = {
                 "local_account_id": int(account_id),
                 "start_date": start_date,
                 "end_date": end_date,
                 "page": page,
                 "page_size": max(page_size, 10),  # min 10
                 "metrics": metrics,
-            })
+            }
+            # Build filtering — support promotion_ids for material→promotion linkage
+            filter_parts: dict = {}
+            if promotion_ids:
+                filter_parts["promotion_ids"] = [int(pid) for pid in promotion_ids]
+            if filter_parts:
+                params["filtering"] = json.dumps(filter_parts)
+
+            result = self._get("/local/report/material/get/", params)
 
             if result.get("code") != 0:
                 if page == 1:
@@ -607,20 +645,20 @@ class OceanEngineClient:
         start_date: str,
         end_date: str,
         metrics: list[str] | None = None,
-        dimensions: list[str] | None = None,
         page_size: int = 50,
     ) -> list[dict]:
         """
         Get project-level report.
 
         Uses: GET /v3.0/local/report/project/get/
+
         Returns data for ALL projects with spend in the date range,
         including deleted projects (history is preserved).
+
+        Note: dimensions (project_id, project_name, stat_time_day, etc.)
+        are automatically returned by the API — no "dimensions" param needed.
         """
         metrics = metrics or LOCAL_PROMOTION_METRICS
-        dimensions = dimensions or [
-            "stat_datetime", "project_id", "project_name",
-        ]
 
         all_rows: list[dict] = []
         page = 1
@@ -633,7 +671,6 @@ class OceanEngineClient:
                 "page": page,
                 "page_size": page_size,
                 "metrics": metrics,
-                "dimensions": dimensions,
             })
 
             if result.get("code") != 0:
@@ -745,20 +782,36 @@ class OceanEngineClient:
         end_date: str,
         page_size: int = 100,
     ) -> list[dict]:
-        """Get clue/lead data (私信咨询/留资详情)."""
+        """Get clue/lead data (私信咨询/留资详情).
+
+        Uses POST /v2/tools/clue/life/get/ — local ad clue list API.
+        """
         all_clues: list[dict] = []
         page = 1
 
         while True:
-            result = self._post("/../open_api/2/tools/clue/life/get/", {
+            url = f"{API_BASE_V2}/2/tools/clue/life/get/"
+            data = json.dumps({
                 "local_account_ids": [int(account_id)],
                 "start_time": f"{start_date} 00:00:00",
                 "end_time": f"{end_date} 23:59:59",
                 "page": page,
                 "page_size": page_size,
-            })
-            # Adjust URL since we're posting to v2 endpoint
-            # Actually, let me fix this - the POST needs the v2 base
+            }).encode("utf-8")
+
+            req = urllib.request.Request(url, data=data)
+            req.add_header("Access-Token", self.auth.get_token())
+            req.add_header("Content-Type", "application/json")
+
+            try:
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    result = json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                body = e.read().decode() if e.fp else str(e)
+                try:
+                    result = json.loads(body)
+                except Exception:
+                    result = {"code": e.code, "message": body}
 
             if result.get("code") != 0:
                 if page == 1:

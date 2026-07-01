@@ -99,6 +99,11 @@ class ETLPipeline:
         total_promos = sum(promo_results.values())
         logger.info("=== Promotion sync: %d promotions across %d accounts ===", total_promos, len(promo_results))
 
+        # Sync project-level data
+        project_results = self._sync_projects(date_str, account_ids)
+        total_projects = sum(project_results.values())
+        logger.info("=== Project sync: %d projects across %d accounts ===", total_projects, len(project_results))
+
         # Refresh account names from API
         self.refresh_account_names(account_ids)
 
@@ -170,6 +175,34 @@ class ETLPipeline:
                 results[aid] = 0
 
         logger.info("=== Promotion sync done: %d total promotions ===", sum(results.values()))
+        return results
+
+    def _sync_projects(
+        self,
+        date_str: str,
+        account_ids: list[str],
+    ) -> dict[str, int]:
+        """
+        Sync project-level data for all accounts on a given date.
+        Returns {account_id: project_count}.
+        """
+        logger.info("=== Syncing project data for %s ===", date_str)
+        results: dict[str, int] = {}
+
+        for i, aid in enumerate(account_ids):
+            try:
+                rows = self.client.get_project_report(aid, date_str, date_str)
+                if rows:
+                    count = self.storage.upsert_project_reports(aid, rows)
+                    results[aid] = count
+                    logger.debug("  [%d/%d] %s: %d projects", i + 1, len(account_ids), aid[-8:], count)
+                else:
+                    results[aid] = 0
+            except Exception as e:
+                logger.debug("  [%d/%d] %s: project skip (%s)", i + 1, len(account_ids), aid[-8:], e)
+                results[aid] = 0
+
+        logger.info("=== Project sync done: %d total projects ===", sum(results.values()))
         return results
 
     def run_backfill(
@@ -244,17 +277,20 @@ class ETLPipeline:
         # Step 3: Sync promotion-level reports (date range API)
         total_promo = self._batch_sync("promotion", date_str_start, date_str_end, account_ids)
 
-        # Step 4: Refresh account names
+        # Step 4: Sync project-level reports (date range API)
+        total_project = self._batch_sync("project", date_str_start, date_str_end, account_ids)
+
+        # Step 5: Refresh account names
         self.refresh_account_names(account_ids)
 
-        # Step 5: Reconciliation — detect gaps from deleted entities
+        # Step 6: Reconciliation — detect gaps from deleted entities
         self._reconciliation_check(date_str_start, date_str_end, account_ids)
 
-        # Step 6: Completeness check
+        # Step 7: Completeness check
         self._completeness_check(date_str_start, date_str_end, account_ids, results)
 
-        logger.info("=== Backfill complete: %d account rows, %d materials, %d promotions ===",
-                     total_rows, total_mat, total_promo)
+        logger.info("=== Backfill complete: %d account rows, %d materials, %d promotions, %d projects ===",
+                     total_rows, total_mat, total_promo, total_project)
 
         return results
 
@@ -267,8 +303,9 @@ class ETLPipeline:
     ) -> int:
         """Sync material or promotion reports for a date range across all accounts.
         Includes retry with exponential backoff and inter-account delay."""
-        label = "material" if report_type == "material" else "promotion"
-        step = 2 if report_type == "material" else 3
+        label = {"material": "material", "promotion": "promotion", "project": "project"}.get(report_type, report_type)
+        step_map = {"material": 2, "promotion": 3, "project": 4}
+        step = step_map.get(report_type, 5)
         total = len(account_ids)
         grand_total = 0
         failed_accounts = []
@@ -282,12 +319,16 @@ class ETLPipeline:
                 try:
                     if report_type == "material":
                         rows = self.client.get_material_report(aid, start_date, end_date)
+                    elif report_type == "project":
+                        rows = self.client.get_project_report(aid, start_date, end_date)
                     else:
                         rows = self.client.get_promotion_report(aid, start_date, end_date)
 
                     if rows:
                         if report_type == "material":
                             count = self.storage.upsert_material_reports(aid, rows)
+                        elif report_type == "project":
+                            count = self.storage.upsert_project_reports(aid, rows)
                         else:
                             count = self.storage.upsert_promotion_reports(aid, rows)
                         grand_total += count

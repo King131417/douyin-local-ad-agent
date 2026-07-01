@@ -73,7 +73,11 @@ CREATE TABLE IF NOT EXISTS promotion_reports (
     show_cnt INTEGER DEFAULT 0,
     click_cnt INTEGER DEFAULT 0,
     ctr REAL DEFAULT 0,
+    cpc_platform REAL DEFAULT 0,
+    cpm_platform REAL DEFAULT 0,
     convert_cnt INTEGER DEFAULT 0,
+    conversion_cost REAL DEFAULT 0,
+    conversion_rate REAL DEFAULT 0,
     message_action_cnt INTEGER DEFAULT 0,
     clue_message_count INTEGER DEFAULT 0,
     raw_data TEXT,
@@ -92,12 +96,39 @@ CREATE TABLE IF NOT EXISTS material_reports (
     show_cnt INTEGER DEFAULT 0,
     click_cnt INTEGER DEFAULT 0,
     ctr REAL DEFAULT 0,
+    cpc_platform REAL DEFAULT 0,
+    cpm_platform REAL DEFAULT 0,
     convert_cnt INTEGER DEFAULT 0,
+    conversion_cost REAL DEFAULT 0,
+    conversion_rate REAL DEFAULT 0,
+    form_cnt INTEGER DEFAULT 0,
     message_action_cnt INTEGER DEFAULT 0,
     clue_message_count INTEGER DEFAULT 0,
     raw_data TEXT,
     created_at TEXT DEFAULT (datetime('now')),
     UNIQUE(account_id, material_id, stat_date)
+);
+
+CREATE TABLE IF NOT EXISTS project_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id TEXT NOT NULL,
+    project_id TEXT,
+    project_name TEXT,
+    stat_date TEXT NOT NULL,
+    stat_cost REAL DEFAULT 0,
+    show_cnt INTEGER DEFAULT 0,
+    click_cnt INTEGER DEFAULT 0,
+    ctr REAL DEFAULT 0,
+    cpc_platform REAL DEFAULT 0,
+    cpm_platform REAL DEFAULT 0,
+    convert_cnt INTEGER DEFAULT 0,
+    conversion_cost REAL DEFAULT 0,
+    conversion_rate REAL DEFAULT 0,
+    message_action_cnt INTEGER DEFAULT 0,
+    clue_message_count INTEGER DEFAULT 0,
+    raw_data TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(account_id, project_id, stat_date)
 );
 
 CREATE TABLE IF NOT EXISTS optimization_log (
@@ -185,9 +216,46 @@ class Storage:
         except Exception as e:
             logger.warning("Migration check failed (non-critical): %s", e)
         
+        # Migration v1.4: add API-native metric columns to existing tables
+        self._migrate_v14(conn)
+
         conn.commit()
         conn.close()
         logger.info("Database initialized: %s", self.db_path)
+
+    def _migrate_v14(self, conn: sqlite3.Connection):
+        """Add API-native calculated metric columns (v1.4)."""
+        additions = {
+            "account_reports": [
+                ("cpc_platform", "REAL DEFAULT 0"),
+                ("cpm_platform", "REAL DEFAULT 0"),
+                ("conversion_cost", "REAL DEFAULT 0"),
+                ("conversion_rate", "REAL DEFAULT 0"),
+                ("form_cnt", "INTEGER DEFAULT 0"),
+            ],
+            "promotion_reports": [
+                ("cpc_platform", "REAL DEFAULT 0"),
+                ("cpm_platform", "REAL DEFAULT 0"),
+                ("conversion_cost", "REAL DEFAULT 0"),
+                ("conversion_rate", "REAL DEFAULT 0"),
+            ],
+            "material_reports": [
+                ("cpc_platform", "REAL DEFAULT 0"),
+                ("cpm_platform", "REAL DEFAULT 0"),
+                ("conversion_cost", "REAL DEFAULT 0"),
+                ("conversion_rate", "REAL DEFAULT 0"),
+                ("form_cnt", "INTEGER DEFAULT 0"),
+            ],
+        }
+        for table, cols in additions.items():
+            existing = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+            for col_name, col_type in cols:
+                if col_name not in existing:
+                    try:
+                        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_type}")
+                        logger.info("Migration v1.4: added %s.%s %s", table, col_name, col_type)
+                    except Exception as e:
+                        logger.warning("Migration %s.%s failed: %s", table, col_name, e)
 
     def _get_conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, check_same_thread=False)
@@ -250,15 +318,21 @@ class Storage:
                     INSERT INTO account_reports (
                         account_id, stat_date, delivery_type,
                         stat_cost, show_cnt, click_cnt, ctr, convert_cnt,
+                        cpc_platform, cpm_platform, conversion_cost, conversion_rate, form_cnt,
                         message_action_cnt, clue_message_count,
                         phone_confirm_cnt, phone_connect_cnt, clue_pay_order_cnt,
                         cpm, cpc, cpa, cvr, raw_data
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(account_id, stat_date, delivery_type)
                     DO UPDATE SET
                         stat_cost=excluded.stat_cost, show_cnt=excluded.show_cnt,
                         click_cnt=excluded.click_cnt, ctr=excluded.ctr,
                         convert_cnt=excluded.convert_cnt,
+                        cpc_platform=excluded.cpc_platform,
+                        cpm_platform=excluded.cpm_platform,
+                        conversion_cost=excluded.conversion_cost,
+                        conversion_rate=excluded.conversion_rate,
+                        form_cnt=excluded.form_cnt,
                         message_action_cnt=excluded.message_action_cnt,
                         clue_message_count=excluded.clue_message_count,
                         phone_confirm_cnt=excluded.phone_confirm_cnt,
@@ -277,6 +351,11 @@ class Storage:
                         self._int(row, "click_cnt"),
                         self._float(row, "ctr"),
                         self._int(row, "convert_cnt"),
+                        self._float(row, "cpc_platform"),
+                        self._float(row, "cpm_platform"),
+                        self._float(row, "conversion_cost"),
+                        self._float(row, "conversion_rate"),
+                        self._int(row, "form_cnt"),
                         self._int(row, "message_action_cnt"),
                         self._int(row, "clue_message_count"),
                         self._int(row, "phone_confirm_cnt"),
@@ -483,16 +562,23 @@ class Storage:
                     """
                     INSERT INTO material_reports (
                         account_id, material_id, material_name, material_type, stat_date,
-                        stat_cost, show_cnt, click_cnt, ctr, convert_cnt,
+                        stat_cost, show_cnt, click_cnt, ctr,
+                        cpc_platform, cpm_platform,
+                        convert_cnt, conversion_cost, conversion_rate, form_cnt,
                         message_action_cnt, clue_message_count, raw_data
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(account_id, material_id, stat_date)
                     DO UPDATE SET
                         material_name=excluded.material_name,
                         material_type=excluded.material_type,
                         stat_cost=excluded.stat_cost, show_cnt=excluded.show_cnt,
                         click_cnt=excluded.click_cnt, ctr=excluded.ctr,
+                        cpc_platform=excluded.cpc_platform,
+                        cpm_platform=excluded.cpm_platform,
                         convert_cnt=excluded.convert_cnt,
+                        conversion_cost=excluded.conversion_cost,
+                        conversion_rate=excluded.conversion_rate,
+                        form_cnt=excluded.form_cnt,
                         message_action_cnt=excluded.message_action_cnt,
                         clue_message_count=excluded.clue_message_count,
                         raw_data=excluded.raw_data
@@ -507,7 +593,12 @@ class Storage:
                         self._int(row, "show_cnt"),
                         self._int(row, "click_cnt"),
                         self._float(row, "ctr"),
+                        self._float(row, "cpc_platform"),
+                        self._float(row, "cpm_platform"),
                         self._int(row, "convert_cnt"),
+                        self._float(row, "conversion_cost"),
+                        self._float(row, "conversion_rate"),
+                        self._int(row, "form_cnt"),
                         self._int(row, "message_action_cnt"),
                         self._int(row, "clue_message_count"),
                         json.dumps(row, ensure_ascii=False, default=str),
@@ -539,9 +630,11 @@ class Storage:
                         project_id, project_name,
                         local_life_shop_id, local_life_shop_name,
                         stat_date,
-                        stat_cost, show_cnt, click_cnt, ctr, convert_cnt,
+                        stat_cost, show_cnt, click_cnt, ctr,
+                        cpc_platform, cpm_platform,
+                        convert_cnt, conversion_cost, conversion_rate,
                         message_action_cnt, clue_message_count, raw_data
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(account_id, promotion_id, stat_date)
                     DO UPDATE SET
                         promotion_name=excluded.promotion_name,
@@ -552,7 +645,11 @@ class Storage:
                         local_life_shop_name=excluded.local_life_shop_name,
                         stat_cost=excluded.stat_cost, show_cnt=excluded.show_cnt,
                         click_cnt=excluded.click_cnt, ctr=excluded.ctr,
+                        cpc_platform=excluded.cpc_platform,
+                        cpm_platform=excluded.cpm_platform,
                         convert_cnt=excluded.convert_cnt,
+                        conversion_cost=excluded.conversion_cost,
+                        conversion_rate=excluded.conversion_rate,
                         message_action_cnt=excluded.message_action_cnt,
                         clue_message_count=excluded.clue_message_count,
                         raw_data=excluded.raw_data
@@ -566,12 +663,16 @@ class Storage:
                         row.get("project_name", ""),
                         row.get("local_life_shop_id", ""),
                         row.get("local_life_shop_name", ""),
-                        row.get("stat_time_day", row.get("stat_datetime", row.get("stat_date", ""))),  # API returns stat_time_day
+                        row.get("stat_time_day", row.get("stat_date", "")),
                         self._float(row, "stat_cost"),
                         self._int(row, "show_cnt"),
                         self._int(row, "click_cnt"),
                         self._float(row, "ctr"),
+                        self._float(row, "cpc_platform"),
+                        self._float(row, "cpm_platform"),
                         self._int(row, "convert_cnt"),
+                        self._float(row, "conversion_cost"),
+                        self._float(row, "conversion_rate"),
                         self._int(row, "message_action_cnt"),
                         self._int(row, "clue_message_count"),
                         json.dumps(row, ensure_ascii=False, default=str),
@@ -581,6 +682,68 @@ class Storage:
             except Exception as e:
                 logger.warning("Promotion upsert failed for %s/%s: %s",
                               account_id, row.get("promotion_id", "?"), e)
+
+        conn.commit()
+        return count
+
+    # ── Project Reports ────────────────────────────────────────
+
+    def upsert_project_reports(self, account_id: str, rows: list[dict]) -> int:
+        """Insert/update project-level report rows.
+
+        Uses: data from GET /v3.0/local/report/project/get/
+        Returns project_list rows with stat_time_day, project_id, project_name, etc.
+        """
+        conn = self._get_conn()
+        count = 0
+        for row in rows:
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO project_reports (
+                        account_id, project_id, project_name, stat_date,
+                        stat_cost, show_cnt, click_cnt, ctr,
+                        cpc_platform, cpm_platform,
+                        convert_cnt, conversion_cost, conversion_rate,
+                        message_action_cnt, clue_message_count, raw_data
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(account_id, project_id, stat_date)
+                    DO UPDATE SET
+                        project_name=excluded.project_name,
+                        stat_cost=excluded.stat_cost, show_cnt=excluded.show_cnt,
+                        click_cnt=excluded.click_cnt, ctr=excluded.ctr,
+                        cpc_platform=excluded.cpc_platform,
+                        cpm_platform=excluded.cpm_platform,
+                        convert_cnt=excluded.convert_cnt,
+                        conversion_cost=excluded.conversion_cost,
+                        conversion_rate=excluded.conversion_rate,
+                        message_action_cnt=excluded.message_action_cnt,
+                        clue_message_count=excluded.clue_message_count,
+                        raw_data=excluded.raw_data
+                    """,
+                    (
+                        str(account_id),
+                        str(row.get("project_id", "")),
+                        row.get("project_name", ""),
+                        row.get("stat_time_day", row.get("stat_date", "")),
+                        self._float(row, "stat_cost"),
+                        self._int(row, "show_cnt"),
+                        self._int(row, "click_cnt"),
+                        self._float(row, "ctr"),
+                        self._float(row, "cpc_platform"),
+                        self._float(row, "cpm_platform"),
+                        self._int(row, "convert_cnt"),
+                        self._float(row, "conversion_cost"),
+                        self._float(row, "conversion_rate"),
+                        self._int(row, "message_action_cnt"),
+                        self._int(row, "clue_message_count"),
+                        json.dumps(row, ensure_ascii=False, default=str),
+                    ),
+                )
+                count += 1
+            except Exception as e:
+                logger.warning("Project upsert failed for %s/%s: %s",
+                              account_id, row.get("project_id", "?"), e)
 
         conn.commit()
         return count

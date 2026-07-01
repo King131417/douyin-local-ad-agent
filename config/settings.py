@@ -56,7 +56,7 @@ DEFAULT_REPORT_DIMENSIONS = [
     "advertiser_id",
     "campaign_id",
     "ad_id",
-    "stat_datetime",
+    "stat_time_day",
 ]
 
 # ── 本地推报表配置 (v3.0 local/report/promotion/get/) ───────────
@@ -65,22 +65,22 @@ LOCAL_PROMOTION_METRICS = [
     "show_cnt",            # 展示量
     "click_cnt",           # 点击量
     "ctr",                 # 点击率
-    "cpm_platform",        # CPM
-    "cpc_platform",        # CPC
+    "cpm_platform",        # CPM（API 原生）
+    "cpc_platform",        # CPC（API 原生）
     "convert_cnt",         # 转化数
-    "conversion_cost",     # 转化成本
-    "conversion_rate",     # 转化率
+    "conversion_cost",     # 转化成本（API 原生）
+    "conversion_rate",     # 转化率（API 原生）
     "dy_follow",           # 抖音关注
-    "dy_likes",            # 抖音点赞
+    "dy_like",             # 抖音点赞
     "dy_comment",          # 抖音评论
     "dy_share",            # 抖音分享
-    "live_watch_one_minute_cnt",  # 直播间观看1分钟
+    "live_watch_one_minute_count",  # 直播间观看1分钟
     "dy_home_visited",     # 抖音主页访问
-    "form",                # 表单提交
+    "form_cnt",            # 表单提交
 ]
 
 LOCAL_PROMOTION_DIMENSIONS = [
-    "stat_datetime",       # 日期
+    "stat_time_day",       # 日期
     "promotion_id",        # 投放计划ID
     "promotion_name",      # 投放计划名称
     "promotion_status",    # 投放状态
