@@ -373,9 +373,6 @@ class Storage:
         conn = sqlite3.connect(self.db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         return conn
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        return conn
 
     # ── Account Management ─────────────────────────────────────
 
@@ -393,6 +390,7 @@ class Storage:
             (str(account_id), name),
         )
         conn.commit()
+        conn.close()
 
     def get_accounts(self, active_only: bool = True) -> list[dict]:
         """Get all accounts, optionally only active ones."""
@@ -401,7 +399,9 @@ class Storage:
         if active_only:
             query += " WHERE status = 'active'"
         query += " ORDER BY account_id"
-        return [dict(r) for r in conn.execute(query).fetchall()]
+        _result = [dict(r) for r in conn.execute(query).fetchall()]
+        conn.close()
+        return _result
 
     def get_account_ids(self) -> list[str]:
         """Get list of active account IDs."""
@@ -496,6 +496,7 @@ class Storage:
                 logger.warning("Upsert failed for %s (%s): %s", account_id, delivery_type, e)
 
         conn.commit()
+        conn.close()
         return count
 
     def _float(self, row: dict, key: str) -> float:
@@ -557,7 +558,9 @@ class Storage:
         where = " AND ".join(conditions) if conditions else "1=1"
         query = f"SELECT * FROM account_reports WHERE {where} ORDER BY stat_date DESC LIMIT ?"
         params.append(limit)
-        return [dict(row) for row in conn.execute(query, params).fetchall()]
+        _result = [dict(row) for row in conn.execute(query, params).fetchall()]
+        conn.close()
+        return _result
 
     def get_daily_summary(self, date_str: str, account_id: str | None = None,
                           delivery_type: str = "total") -> dict:
@@ -591,6 +594,7 @@ class Storage:
             """,
             params,
         ).fetchone()
+        conn.close()
         return dict(row) if row else {}
 
     def get_trend(
@@ -633,6 +637,7 @@ class Storage:
             """,
             params,
         ).fetchall()
+        conn.close()
         return [dict(r) for r in rows]
 
     def get_account_ranking(
@@ -671,6 +676,7 @@ class Storage:
             """,
             (start_date, end_date, delivery_type, top_n),
         ).fetchall()
+        conn.close()
         return [dict(r) for r in rows]
 
     # ── Material Reports ───────────────────────────────────────
@@ -758,6 +764,7 @@ class Storage:
                 logger.warning("Material upsert failed for %s: %s", account_id, e)
 
         conn.commit()
+        conn.close()
         return count
 
     # ── Promotion Reports ─────────────────────────────────────
@@ -837,6 +844,7 @@ class Storage:
                               account_id, row.get("promotion_id", "?"), e)
 
         conn.commit()
+        conn.close()
         return count
 
     # ── Project Reports ────────────────────────────────────────
@@ -903,6 +911,7 @@ class Storage:
                               account_id, row.get("project_id", "?"), e)
 
         conn.commit()
+        conn.close()
         return count
 
     def get_material_reports(
@@ -933,7 +942,9 @@ class Storage:
         where = " AND ".join(conditions) if conditions else "1=1"
         query = f"SELECT * FROM material_reports WHERE {where} ORDER BY stat_cost DESC LIMIT ?"
         params.append(limit)
-        return [dict(row) for row in conn.execute(query, params).fetchall()]
+        _result = [dict(row) for row in conn.execute(query, params).fetchall()]
+        conn.close()
+        return _result
 
     def get_material_summary(
         self, date_str: str | None = None,
@@ -991,6 +1002,7 @@ class Storage:
             """,
             params,
         ).fetchall()
+        conn.close()
         return [dict(r) for r in rows]
 
     def get_material_ranking(
@@ -1032,6 +1044,7 @@ class Storage:
             """,
             (start_date, end_date, top_n),
         ).fetchall()
+        conn.close()
         return [dict(r) for r in rows]
 
     def get_account_material_summary(
@@ -1056,6 +1069,7 @@ class Storage:
             """,
             (str(account_id), date_str),
         ).fetchone()
+        conn.close()
         return dict(row) if row else {}
 
     def get_zero_performance_materials(self, date_str: str) -> list[dict]:
@@ -1076,6 +1090,7 @@ class Storage:
             """,
             (date_str,),
         ).fetchall()
+        conn.close()
         return [dict(r) for r in rows]
 
     # ── Optimization Log ───────────────────────────────────────
@@ -1105,6 +1120,7 @@ class Storage:
             ),
         )
         conn.commit()
+        conn.close()
 
     def get_optimization_history(
         self, account_id: str | None = None, limit: int = 50
@@ -1119,10 +1135,33 @@ class Storage:
         where = " AND ".join(conditions) if conditions else "1=1"
         query = f"SELECT * FROM optimization_log WHERE {where} ORDER BY created_at DESC LIMIT ?"
         params.append(limit)
-        return [dict(r) for r in conn.execute(query, params).fetchall()]
+        _result = [dict(r) for r in conn.execute(query, params).fetchall()]
+        conn.close()
+        return _result
 
     def close(self):
         pass  # Connections are created per-call, no persistent connection to close
+
+    def backup_database(self, keep: int = 7) -> str | None:
+        """Backup database to data/*.backup-YYYYMMDD, keep last N backups."""
+        import shutil
+        from datetime import datetime
+        backup_dir = Path(self.db_path).parent
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup_path = backup_dir / f"{Path(self.db_path).stem}.backup-{timestamp}"
+        try:
+            shutil.copy2(self.db_path, backup_path)
+            logger.info("Database backed up to %s (%.1f MB)", 
+                       backup_path.name, backup_path.stat().st_size / 1024 / 1024)
+            # Cleanup old backups
+            backups = sorted(backup_dir.glob(f"{Path(self.db_path).stem}.backup-*"))
+            for old in backups[:-keep]:
+                old.unlink()
+                logger.debug("Removed old backup: %s", old.name)
+            return str(backup_path)
+        except OSError as e:
+            logger.error("Database backup failed: %s", e)
+            return None
 
     def get_latest_date(self, table: str = "material_reports") -> str | None:
         """Get the most recent date with data in a table."""
@@ -1130,4 +1169,5 @@ class Storage:
         row = conn.execute(
             f"SELECT MAX(stat_date) as latest FROM {table}"
         ).fetchone()
+        conn.close()
         return row["latest"] if row else None

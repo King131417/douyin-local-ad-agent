@@ -143,6 +143,11 @@ class AdDataScheduler:
             )
             sync_status.done(total)
             logger.info("Scheduled sync done: %d rows", total)
+            # Auto-backup after successful sync
+            try:
+                self.pipeline.storage.backup_database(keep=7)
+            except Exception:
+                pass  # backup failure is non-critical
         except Exception as e:
             logger.error("Scheduled sync failed: %s", e, exc_info=True)
             sync_status.failed(str(e))

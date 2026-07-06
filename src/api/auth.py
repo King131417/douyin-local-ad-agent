@@ -124,42 +124,69 @@ class AuthManager:
         )
 
     def _refresh_access_token(self):
-        """Refresh using refresh_token. Falls back to app_access_token."""
+        """Refresh using refresh_token with retry. Falls back to app_access_token."""
         app_id = int(OCEAN_ENGINE_APP_ID) if OCEAN_ENGINE_APP_ID else 0
+        max_retries = 3
 
-        if self._refresh_token:
-            resp = requests.post(
-                f"{OCEAN_ENGINE_AUTH_URL}/refresh_token/",
-                json={
-                    "app_id": app_id,
-                    "secret": OCEAN_ENGINE_SECRET,
-                    "grant_type": "refresh_token",
-                    "refresh_token": self._refresh_token,
-                },
-                timeout=30,
-            )
-        else:
-            resp = requests.post(
-                f"{OCEAN_ENGINE_AUTH_URL}/access_token/",
-                json={
-                    "app_id": app_id,
-                    "secret": OCEAN_ENGINE_SECRET,
-                    "grant_type": "app_access_token",
-                },
-                timeout=30,
-            )
+        for attempt in range(max_retries):
+            try:
+                if self._refresh_token:
+                    resp = requests.post(
+                        f"{OCEAN_ENGINE_AUTH_URL}/refresh_token/",
+                        json={
+                            "app_id": app_id,
+                            "secret": OCEAN_ENGINE_SECRET,
+                            "grant_type": "refresh_token",
+                            "refresh_token": self._refresh_token,
+                        },
+                        timeout=30,
+                    )
+                else:
+                    resp = requests.post(
+                        f"{OCEAN_ENGINE_AUTH_URL}/access_token/",
+                        json={
+                            "app_id": app_id,
+                            "secret": OCEAN_ENGINE_SECRET,
+                            "grant_type": "app_access_token",
+                        },
+                        timeout=30,
+                    )
 
-        data = resp.json()
-        if data.get("code") != 0:
-            raise RuntimeError(f"Token refresh failed: {data.get('message', data)}")
+                data = resp.json()
+                if data.get("code") != 0:
+                    msg = data.get("message", str(data))
+                    if "refresh_token" in str(msg).lower():
+                        raise RuntimeError(f"Token refresh failed (permanent): {msg}")
+                    if attempt < max_retries - 1:
+                        wait = 2 ** attempt
+                        logger.warning("Token refresh attempt %d failed: %s, retry in %ds", attempt + 1, msg, wait)
+                        time.sleep(wait)
+                        continue
+                    raise RuntimeError(f"Token refresh failed: {msg}")
 
-        result = data["data"]
-        self._access_token = result["access_token"]
-        self._refresh_token = result.get("refresh_token", self._refresh_token)
-        self._expires_at = time.time() + result.get("expires_in", 86400)
-        self._advertiser_ids = result.get("advertiser_ids", self._advertiser_ids)
-        self._save_token_cache()
-        logger.info("Token refreshed (expires in %ds)", result.get("expires_in", 86400))
+                result = data["data"]
+                self._access_token = result["access_token"]
+                self._refresh_token = result.get("refresh_token", self._refresh_token)
+                self._expires_at = time.time() + result.get("expires_in", 86400)
+                self._advertiser_ids = result.get("advertiser_ids", self._advertiser_ids)
+                self._save_token_cache()
+                logger.info("Token refreshed (expires in %ds)", result.get("expires_in", 86400))
+                return
+
+            except requests.exceptions.RequestException as e:
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt
+                    logger.warning("Token refresh network error (attempt %d): %s, retry in %ds", attempt + 1, e, wait)
+                    time.sleep(wait)
+                else:
+                    raise RuntimeError(f"Token refresh failed after {max_retries} attempts: {e}")
+            except (json.JSONDecodeError, KeyError) as e:
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt
+                    logger.warning("Token refresh malformed response (attempt %d): %s", attempt + 1, e)
+                    time.sleep(wait)
+                else:
+                    raise RuntimeError(f"Token refresh failed: malformed response")
 
     def _exchange_auth_code(self):
         """Exchange authorization code for access token."""

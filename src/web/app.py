@@ -22,12 +22,70 @@ from src.pipeline.scheduler import AdDataScheduler, sync_status
 
 logger = logging.getLogger(__name__)
 
+# Configure app-level logging
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logging.getLogger("apscheduler").setLevel(logging.WARNING)
+    logging.getLogger("werkzeug").setLevel(logging.WARNING)
+
 app = Flask(__name__,
             template_folder=os.path.join(os.path.dirname(__file__), 'templates'))
-kpi = KPIAnalyzer()
-engine = MaterialDecisionEngine()
-storage = Storage()
-radar = QualityRadar()
+
+# Startup validation
+def _validate_env():
+    """Check required env vars on startup. Warn but don't crash."""
+    required = ["OCEAN_ENGINE_APP_ID", "OCEAN_ENGINE_SECRET", "OCEAN_ENGINE_AUTH_CODE"]
+    missing = [k for k in required if not os.getenv(k)]
+    if missing:
+        logger.warning("Missing env vars: %s — data sync will fail", ", ".join(missing))
+        return False
+    return True
+
+_startup_ok = _validate_env()
+
+# Lazy init — only create on first access to avoid startup crash
+_kpi: KPIAnalyzer | None = None
+_engine: MaterialDecisionEngine | None = None
+_storage: Storage | None = None
+_radar: QualityRadar | None = None
+_init_error: str | None = None
+
+def _get_storage() -> Storage:
+    global _storage, _init_error
+    if _storage is None and _init_error is None:
+        try:
+            _storage = Storage()
+        except Exception as e:
+            _init_error = f"Database init failed: {e}"
+            logger.critical("Storage init failed: %s", e)
+            raise
+    if _init_error:
+        raise RuntimeError(_init_error)
+    return _storage
+
+def _get_kpi() -> KPIAnalyzer:
+    global _kpi
+    if _kpi is None:
+        _kpi = KPIAnalyzer()
+    return _kpi
+
+def _get_engine() -> MaterialDecisionEngine:
+    global _engine
+    if _engine is None:
+        _engine = MaterialDecisionEngine()
+    return _engine
+
+def _get_radar() -> QualityRadar:
+    global _radar
+    if _radar is None:
+        _radar = QualityRadar()
+    return _radar
 
 # ── Helpers ─────────────────────────────────────────────────────
 _scheduler: AdDataScheduler | None = None
@@ -41,7 +99,7 @@ def _start_scheduler():
 
 
 def _default_date() -> str:
-    return storage.get_latest_date("material_reports") or (
+    return _get_storage().get_latest_date("material_reports") or (
         date.today() - timedelta(days=1)
     ).strftime("%Y-%m-%d")
 
@@ -80,7 +138,7 @@ def static_files(filename):
 @app.route("/api/summary")
 def api_summary():
     days = int(request.args.get("days", 7))
-    trend = kpi.trend(days)
+    trend = _get_kpi().trend(days)
     today = trend[-1] if trend else {}
     return jsonify({"today": today, "trend": trend})
 
@@ -90,7 +148,7 @@ def api_decision():
     start_date = request.args.get("start_date")
     end_date = request.args.get("end_date")
     date_str = request.args.get("date") or _default_date()
-    result = engine.analyze(date_str=date_str, start_date=start_date, end_date=end_date)
+    result = _get_engine().analyze(date_str=date_str, start_date=start_date, end_date=end_date)
     return jsonify(result)
 
 
@@ -99,7 +157,7 @@ def api_account_detail(account_id: str):
     start_date = request.args.get("start_date")
     end_date = request.args.get("end_date")
     date_str = request.args.get("date") or _default_date()
-    result = engine.get_account_detail(
+    result = _get_engine().get_account_detail(
         account_id, date_str=date_str,
         start_date=start_date, end_date=end_date,
     )
@@ -111,7 +169,7 @@ def api_ranking():
     start_date = request.args.get("start_date")
     end_date = request.args.get("end_date")
     date_str = request.args.get("date") or _default_date()
-    ranking = engine.get_full_ranking(date_str=date_str, start_date=start_date, end_date=end_date)
+    ranking = _get_engine().get_full_ranking(date_str=date_str, start_date=start_date, end_date=end_date)
     return jsonify({"materials": ranking, "total": len(ranking)})
 
 
@@ -1106,38 +1164,73 @@ def api_radar_accounts():
     days = int(request.args.get("days", 7))
     start_date = request.args.get("start_date")
     end_date = request.args.get("end_date")
-    return jsonify(radar.accounts(days, start_date=start_date, end_date=end_date))
+    return jsonify(_get_radar().accounts(days, start_date=start_date, end_date=end_date))
 
 
 @app.route("/api/radar/promotions/<account_id>")
 def api_radar_promotions(account_id):
     """投手诊断：指定账户的项目/广告级诊断"""
     days = int(request.args.get("days", 7))
-    return jsonify(radar.promotions(account_id, days))
+    return jsonify(_get_radar().promotions(account_id, days))
 
 
 @app.route("/api/radar/materials/<account_id>")
 def api_radar_materials(account_id):
     """投手诊断：指定账户的素材级诊断"""
     days = int(request.args.get("days", 7))
-    return jsonify(radar.materials(account_id, days))
-
+    return jsonify(_get_radar().materials(account_id, days))
 
 @app.route("/api/radar/battle")
 def api_radar_battle():
-    """每日作战清单：放量/降量/疲劳/陷阱/排查 五张表"""
+    """每日作战清单"""
     days = int(request.args.get("days", 7))
     start_date = request.args.get("start_date")
     end_date = request.args.get("end_date")
-    return jsonify(radar.battle_list(days, start_date=start_date, end_date=end_date))
+    return jsonify(_get_radar().battle_list(days, start_date=start_date, end_date=end_date))
+
+
+# ── Health Check ─────────────────────────────────────────────────
+
+@app.route("/api/health")
+def api_health():
+    """Health check endpoint for monitoring and systemd probes."""
+    status = {"status": "ok", "db": False, "last_sync": None, "uptime": None}
+    try:
+        s = _get_storage()
+        latest = s.get_latest_date("material_reports")
+        status["db"] = True
+        status["last_sync"] = latest
+    except Exception as e:
+        status["db"] = False
+        status["error"] = str(e)
+    return jsonify(status), 200 if status["db"] else 503
+
+
+# ── Error Handlers ───────────────────────────────────────────────
+
+@app.errorhandler(404)
+def on_404(e):
+    if request.path.startswith("/api/"):
+        return jsonify({"error": "not found", "path": request.path}), 404
+    return render_template("error.html", code=404, message="页面不存在"), 404
+
+@app.errorhandler(500)
+def on_500(e):
+    logger.exception("Internal server error on %s", request.path)
+    if request.path.startswith("/api/"):
+        return jsonify({"error": "internal error"}), 500
+    return render_template("error.html", code=500, message="服务器内部错误"), 500
+
+@app.errorhandler(503)
+def on_503(e):
+    return jsonify({"error": "service unavailable"}), 503
 
 
 # ── Start ────────────────────────────────────────────────────────
 
 def start_dashboard(port: int = 8888, debug: bool = False):
     logger.info("Starting dual cockpit on http://localhost:%d", port)
-    import os as _os
-    if not debug or _os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+    if not debug or (debug and os.environ.get("WERKZEUG_RUN_MAIN") == "true"):
         _start_scheduler()
     app.run(host="0.0.0.0", port=port, debug=debug)
 

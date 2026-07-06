@@ -6,9 +6,15 @@ import os
 import sys
 import signal
 import atexit
+from pathlib import Path
 
-PROJECT_DIR = "/Users/selfgrowing/WorkBuddy/2026-06-22-23-51-30/douyin-local-ad-agent"
-PID_FILE = "/tmp/dashboard_daemon.pid"
+PROJECT_DIR = str(Path(__file__).resolve().parent)
+DATA_DIR = str(Path(PROJECT_DIR) / "data")
+PID_FILE = str(Path(DATA_DIR) / "dashboard.pid")
+LOG_FILE = str(Path(DATA_DIR) / "dashboard.log")
+
+# Ensure data directory exists
+Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
 
 def daemonize():
     """Double-fork to daemonize the process."""
@@ -42,7 +48,7 @@ def daemonize():
     sys.stderr.flush()
     with open("/dev/null", "r") as devnull:
         os.dup2(devnull.fileno(), sys.stdin.fileno())
-    with open("/tmp/dashboard.log", "a") as f:
+    with open(LOG_FILE, "a") as f:
         os.dup2(f.fileno(), sys.stdout.fileno())
         os.dup2(f.fileno(), sys.stderr.fileno())
 
