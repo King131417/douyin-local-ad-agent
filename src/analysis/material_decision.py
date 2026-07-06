@@ -179,6 +179,10 @@ class MaterialDecisionEngine:
                     "material_name": r.get("material_name", ""),
                     "material_type": r.get("material_type", ""),
                     "account_id": r.get("account_id", account_id),
+                    "promotion_id": r.get("promotion_id") or "",
+                    "promotion_name": r.get("promotion_name") or "",
+                    "project_id": r.get("project_id") or "",
+                    "project_name": r.get("project_name") or "",
                     "total_cost": 0, "total_show": 0, "total_click": 0,
                     "total_convert": 0, "total_consult": 0, "total_clue": 0,
                 }
@@ -189,6 +193,15 @@ class MaterialDecisionEngine:
             m["total_convert"] += r.get("convert_cnt", 0) or 0
             m["total_consult"] += r.get("message_action_cnt", 0) or 0
             m["total_clue"] += r.get("clue_message_count", 0) or 0
+            # Prefer first non-empty attribution name
+            if not m["promotion_name"] and r.get("promotion_name"):
+                m["promotion_name"] = r["promotion_name"]
+            if not m["project_name"] and r.get("project_name"):
+                m["project_name"] = r["project_name"]
+            if not m["promotion_id"] and r.get("promotion_id"):
+                m["promotion_id"] = r["promotion_id"]
+            if not m["project_id"] and r.get("project_id"):
+                m["project_id"] = r["project_id"]
 
         materials = list(mat_map.values())
         for m in materials:
@@ -497,10 +510,34 @@ class MaterialDecisionEngine:
         scatter.sort(key=lambda s: -s["y"])
         return scatter[:500]
 
+    def _material_item(self, m: dict) -> dict:
+        """提取素材的关键字段用于建议展示"""
+        return {
+            "material_id": m.get("material_id", "") or "",
+            "material_name": m.get("material_name", "") or "",
+            "account_id": m.get("account_id", "") or "",
+            "account_name": m.get("account_name", "") or "",
+            "promotion_id": m.get("promotion_id", "") or "",
+            "promotion_name": m.get("promotion_name", "") or "",
+            "project_id": m.get("project_id", "") or "",
+            "project_name": m.get("project_name", "") or "",
+            "total_cost": m.get("total_cost", 0) or 0,
+            "total_show": m.get("total_show", 0) or 0,
+            "total_click": m.get("total_click", 0) or 0,
+            "total_clue": m.get("total_clue", 0) or 0,
+            "ctr": m.get("ctr", 0) or 0,
+            "lead_cpa": m.get("lead_cpa", 0) or 0,
+            "consult_cpa": m.get("consult_cpa", 0) or 0,
+            "lead_conv_rate": m.get("lead_conv_rate", 0) or 0,
+            "is_trap": m.get("is_trap", False),
+            "action": m.get("action", ""),
+            "efficiency_score": m.get("efficiency_score", 0) or 0,
+        }
+
     def _generate_suggestions(
         self, quadrant: dict, scale_up: list[dict], pause: list[dict]
     ) -> list[dict]:
-        """生成逐条可执行 + 量化影响的优化建议"""
+        """生成逐条可执行 + 量化影响的优化建议（附带素材明细）"""
         suggestions = []
 
         # ── 明星素材放量建议（转化成本口径）──
@@ -518,6 +555,12 @@ class MaterialDecisionEngine:
                 "body": f"以下素材转化成本低、效率优：{'、'.join(items)}。建议预算提升25~50%，预计多拿~{total_extra:.0f}留资。",
                 "priority": "high",
                 "quantified": f"+{total_extra:.0f}留资预期",
+                "materials": [self._material_item(m) for m in top5],
+                "action_items": [
+                    "提升预算 25~50%",
+                    "增加同一项目的相似素材投放",
+                    "监控留资成本，若上涨则回调",
+                ],
             })
 
         # ── 陷阱素材警告 ──
@@ -535,30 +578,50 @@ class MaterialDecisionEngine:
                 "title": f"🪤 {len(traps)} 条素材为「便宜但留资差」陷阱",
                 "body": f"咨询成本低但留资率<50%，真实转化成本偏高。已禁止进入放量清单：{'、'.join(trap_items)}。建议优化留资链路/私信话术。",
                 "priority": "high",
+                "materials": [self._material_item(m) for m in traps[:5]],
+                "action_items": [
+                    "检查私信自动回复话术，增加留资引导",
+                    "优化落地页表单字段，减少用户放弃率",
+                    "若3天内无改善，直接暂停该素材",
+                ],
             })
 
         # ── 淘汰素材暂停建议 ──
         stop_materials = [m for m in pause if m["action"] == "abandon"]
         if stop_materials:
             waste_cost = sum(m.get("total_cost", 0) for m in stop_materials)
+            top5 = stop_materials[:5]
             suggestions.append({
                 "type": "pause",
                 "title": f"⚠️ {len(stop_materials)} 条素材建议立即暂停",
                 "body": f"有消耗({waste_cost:.0f}元)但零留资。暂停后可释放预算给明星素材，预计每月省 ¥{waste_cost * 4:.0f}（按周耗推断）。",
                 "priority": "high",
                 "quantified": f"月省¥{waste_cost * 4:.0f}",
+                "materials": [self._material_item(m) for m in top5],
+                "action_items": [
+                    "立即在后台暂停这些素材",
+                    "将释放预算转投「建议放量」清单中的素材",
+                    "复盘素材内容，分析为何无留资",
+                ],
             })
 
         # ── 高耗低效素材优化建议 ──
         optimize = [m for m in pause if m["action"] == "pause" and not m.get("is_trap")]
         if optimize:
             total_cost = sum(m.get("total_cost", 0) for m in optimize)
+            top5 = optimize[:5]
             suggestions.append({
                 "type": "optimize",
                 "title": f"💡 {len(optimize)} 条素材转化成本偏高，建议降预算或优化",
                 "body": f"合计消耗 ¥{total_cost:.0f}，但转化成本高于账户中位数。建议：①降出价5~10%；②优化落地页留资路径；③若优化后无改善则停止。",
                 "priority": "medium",
                 "quantified": f"可省 ¥{total_cost * 0.3:.0f}",
+                "materials": [self._material_item(m) for m in top5],
+                "action_items": [
+                    "降低出价 5~10%",
+                    "A/B测试落地页，减少留资流失",
+                    "3天后若CPA未降，直接暂停",
+                ],
             })
 
         # ── 素材生产方向建议 ──
@@ -566,11 +629,18 @@ class MaterialDecisionEngine:
         if star_mats:
             avg_lcpa = sum(m["lead_cpa"] for m in star_mats) / len(star_mats)
             avg_lead = sum(m["total_clue"] for m in star_mats) / max(len(star_mats), 1)
+            top3 = star_mats[:3]
             suggestions.append({
                 "type": "production",
                 "title": "📹 素材生产方向建议",
                 "body": f"明星素材平均 转化成本 ¥{avg_lcpa:.0f}、均留资{avg_lead:.0f}个。建议：①提炼高留资素材的创意钩子(开头话术/卖点/信任背书)；②复制达人风格批量生产变体；③保持每周≥5条新素材。",
                 "priority": "medium",
+                "materials": [self._material_item(m) for m in top3],
+                "action_items": [
+                    "提炼 TOP3 素材的共性创意钩子",
+                    "复制达人风格，每周生产≥5条变体",
+                    "新素材上架后跑3天再评估",
+                ],
             })
 
         # ── 全局健康度 ──
@@ -585,6 +655,11 @@ class MaterialDecisionEngine:
                     "title": "📊 留资高效素材占比偏低",
                     "body": f"转化成本优于中位数的素材仅占 {star_ratio*100:.0f}%。建议集中资源打造3-5条留资效率高的爆款素材。",
                     "priority": "medium",
+                    "action_items": [
+                        "暂停低效素材，释放预算",
+                        "集中资源测试 3-5 个新创意方向",
+                        "参考行业高留资素材的脚本结构",
+                    ],
                 })
 
         return suggestions

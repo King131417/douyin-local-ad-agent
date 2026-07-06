@@ -7,6 +7,7 @@ Key insight from the working system: list params must be JSON-encoded in query s
 
 import json
 import logging
+import random
 import time
 import urllib.request
 import urllib.parse
@@ -24,54 +25,114 @@ API_BASE_V3 = "https://api.oceanengine.com/open_api/v3.0"
 # Standard API base
 API_BASE_V2 = "https://api.oceanengine.com/open_api"
 
-# Core metrics for local ad account-level reports.
-# These are the metrics verified to work from the old system.
+# ─────────────────────────────────────────────────────────
+# Metrics definitions for local ad reports
+# ─────────────────────────────────────────────────────────
+# All fields verified via API batch testing on 2026-07-03 against
+# account/promotion/material report endpoints (01成都 1839326360573324).
+# Fields prefixed with ❌ below were tested and confirmed NOT in the dataset.
+#
+# ❌ attribution_conversion_cost  — 所有级别均不支持
+# ❌ attribution_clue_message_count — 仅素材级支持，账户/推广级不支持
+# ❌ ad_click_cnt / ad_show_cnt / form_submit_cnt / poi_collection_cnt — 不存在
+# ─────────────────────────────────────────────────────────
+
 LOCAL_ACCOUNT_METRICS = [
-    "stat_cost",           # 消耗
-    "show_cnt",            # 展示量
-    "click_cnt",           # 点击量
-    "ctr",                 # 点击率
-    "cpc_platform",        # 点击均价（API 原生，不用手算）
-    "cpm_platform",        # 千次展示费用（API 原生）
-    "convert_cnt",         # 转化数
-    "conversion_cost",     # 转化成本（API 原生）
-    "conversion_rate",     # 转化率（API 原生）
-    "message_action_cnt",  # 私信咨询数
-    "clue_message_count",  # 私信留资数
-    "phone_confirm_cnt",   # 电话拨打数
-    "phone_connect_cnt",   # 电话接通数
-    "clue_pay_order_cnt",  # 团购线索数
-    "form_cnt",            # 表单提交数
+    # 基础消耗与展示
+    "stat_cost",            # 消耗(元)
+    "show_cnt",             # 展示次数
+    "click_cnt",            # 点击次数
+    "ctr",                  # 点击率
+    "cpc_platform",         # 点击均价
+    "cpm_platform",         # 千次展示费用
+    "convert_cnt",          # 转化数(行为时间)
+    "conversion_cost",      # 转化成本(行为时间)
+    "conversion_rate",      # 转化率(行为时间)
+    # ── 行为时间 - 线索指标 ──
+    "message_action_cnt",   # 私信咨询数
+    "clue_message_count",   # 私信留资数
+    "phone_confirm_cnt",    # 电话拨打
+    "phone_connect_cnt",    # 电话接通
+    "clue_pay_order_cnt",   # 团购线索
+    "form_cnt",             # 表单提交
+    # ── 行为时间 - 意向指标（新增 v1.5）──
+    "intention_form_cnt",               # 意向表单
+    "intention_phone_cnt",              # 意向话单
+    "intention_message_clue_cnt",       # 意向咨询
+    # ── 计费时间 - 转化指标（与后台UI对齐）──
+    "attribution_convert_cnt",                  # 转化数(计费时间)
+    "attribution_conversion_rate",              # 转化率(计费时间)
+    "attribution_message_action_cnt",           # 私信咨询数(计费时间)
+    # ── 计费时间 - 线索指标（新增 v1.5）──
+    "attribution_form_cnt",                     # 表单提交(计费时间)
+    "attribution_clue_pay_order_cnt",           # 团购线索(计费时间)
+    "attribution_phone_confirm_cnt",            # 电话拨打(计费时间)
+    "attribution_phone_connect_cnt",            # 电话接通(计费时间)
+    # ── 计费时间 - 意向指标（新增 v1.5）──
+    "attribution_intention_form_cnt",           # 意向表单(计费时间)
+    "attribution_intention_phone_cnt",          # 意向话单(计费时间)
+    "attribution_intention_message_clue_cnt",   # 意向咨询(计费时间)
+    # ── 直播指标（新增 v1.5）──
+    "luban_live_enter_cnt",             # 直播间观看
+    "live_watch_one_minute_count",      # 直播间超1分钟停留
+    "luban_live_comment_cnt",           # 直播间评论
+    "luban_live_share_cnt",             # 直播间分享
+    # ── 视频播放指标（新增 v1.5）──
+    "play_duration_5s",                 # 5s播放
+    "play_duration_5s_show_cnt_rate",   # 5s播放率
+    "play_25_feed_break",               # 25%进度播放
+    "play_50_feed_break",               # 50%进度播放
+    "play_75_feed_break",               # 75%进度播放
+    "dy_like_rate",                     # 点赞率
 ]
 
-# Extended metrics for video quality analysis
+# Video quality metrics (subset used for material quality analysis)
 LOCAL_VIDEO_METRICS = [
-    "total_play",          # 视频播放次数
-    "play_duration_3s",    # 3s播放
-    "play_over",           # 完播次数
-    "play_over_rate",      # 完播率
-    "dy_like",             # 点赞
-    "dy_comment",          # 评论
-    "dy_share",            # 分享
-    "dy_collect",          # 收藏
-    "dy_follow",           # 新增粉丝
-    "dy_home_visited",     # 主页访问
-    "poi_recommend_count", # 浏览商户人数
+    "total_play",               # 视频播放次数
+    "play_duration_3s",         # 3s播放
+    "play_duration_5s",         # 5s播放
+    "play_duration_5s_show_cnt_rate",  # 5s播放率
+    "play_25_feed_break",       # 25%进度
+    "play_50_feed_break",       # 50%进度
+    "play_75_feed_break",       # 75%进度
+    "play_over",                # 完播次数
+    "play_over_rate",           # 完播率
+    "dy_like",                  # 点赞
+    "dy_like_rate",             # 点赞率
+    "dy_comment",               # 评论
+    "dy_share",                 # 分享
+    "dy_collect",               # 收藏
+    "dy_follow",                # 新增粉丝
+    "dy_home_visited",          # 主页访问
+    "poi_recommend_count",      # 浏览商户人数
 ]
 
-# Promotion-level metrics (subset of the above + promotion dimensions)
+# Promotion-level metrics (same dataset as account-level)
 LOCAL_PROMOTION_METRICS = [
-    "stat_cost",
-    "show_cnt",
-    "click_cnt",
-    "ctr",
-    "cpc_platform",
-    "cpm_platform",
-    "convert_cnt",
-    "conversion_cost",
-    "conversion_rate",
-    "message_action_cnt",
-    "clue_message_count",
+    "stat_cost", "show_cnt", "click_cnt", "ctr",
+    "cpc_platform", "cpm_platform",
+    "convert_cnt", "conversion_cost", "conversion_rate",
+    # 行为时间 - 线索
+    "message_action_cnt", "clue_message_count",
+    # 行为时间 - 意向
+    "intention_form_cnt", "intention_phone_cnt", "intention_message_clue_cnt",
+    # 计费时间 - 转化
+    "attribution_convert_cnt", "attribution_conversion_rate",
+    "attribution_message_action_cnt",
+    # 计费时间 - 线索
+    "attribution_form_cnt", "attribution_clue_pay_order_cnt",
+    "attribution_phone_confirm_cnt", "attribution_phone_connect_cnt",
+    # 计费时间 - 意向
+    "attribution_intention_form_cnt",
+    "attribution_intention_phone_cnt",
+    "attribution_intention_message_clue_cnt",
+    # 直播
+    "luban_live_enter_cnt", "live_watch_one_minute_count",
+    "luban_live_comment_cnt", "luban_live_share_cnt",
+    # 视频播放
+    "play_duration_5s", "play_duration_5s_show_cnt_rate",
+    "play_25_feed_break", "play_50_feed_break", "play_75_feed_break",
+    "dy_like_rate",
 ]
 
 LOCAL_PROMOTION_DIMENSIONS = [
@@ -89,6 +150,12 @@ LOCAL_PROMOTION_DIMENSIONS = [
 class OceanEngineClient:
     """API client for Ocean Engine 本地推 (Local Promotion) v3.0 APIs."""
 
+    # Retry configuration
+    MAX_RETRIES: int = 3
+    RETRY_BASE_DELAY: float = 1.0   # seconds, exponential: base * 2^attempt
+    RETRY_MAX_DELAY: float = 30.0    # cap at 30 seconds
+    RETRYABLE_HTTP_CODES: frozenset = frozenset({429, 500, 502, 503, 504})
+
     def __init__(self, auth: AuthManager | None = None):
         self.auth = auth or AuthManager()
 
@@ -98,6 +165,7 @@ class OceanEngineClient:
         """
         GET request with proper param serialization.
         Lists are JSON-encoded in the query string (required by Ocean Engine API).
+        Includes exponential backoff retry for transient errors (429, 5xx, network).
         """
         query_parts = []
         for k, v in params.items():
@@ -112,38 +180,94 @@ class OceanEngineClient:
 
         url = f"{API_BASE_V3}{endpoint}?{'&'.join(query_parts)}"
 
-        req = urllib.request.Request(url)
-        req.add_header("Access-Token", self.auth.get_token())
-        req.add_header("Content-Type", "application/json")
-
-        try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            body = e.read().decode() if e.fp else str(e)
+        last_exception = None
+        for attempt in range(self.MAX_RETRIES):
             try:
-                return json.loads(body)
-            except Exception:
-                return {"code": e.code, "message": body}
+                req = urllib.request.Request(url)
+                req.add_header("Access-Token", self.auth.get_token())
+                req.add_header("Content-Type", "application/json")
+
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+
+            except urllib.error.HTTPError as e:
+                # Parse body for API-level errors
+                body = e.read().decode() if e.fp else str(e)
+                try:
+                    result = json.loads(body)
+                except Exception:
+                    result = {"code": e.code, "message": body}
+
+                # Retry on rate-limit or server errors
+                if e.code in self.RETRYABLE_HTTP_CODES and attempt < self.MAX_RETRIES - 1:
+                    wait = min(self.RETRY_BASE_DELAY * (2 ** attempt), self.RETRY_MAX_DELAY)
+                    wait += random.uniform(0, 1)  # jitter
+                    logger.debug("GET %s → HTTP %d, retry in %.1fs (attempt %d/%d)",
+                                 endpoint, e.code, wait, attempt + 1, self.MAX_RETRIES)
+                    time.sleep(wait)
+                    last_exception = e
+                    continue
+                return result
+
+            except (urllib.error.URLError, OSError, TimeoutError) as e:
+                last_exception = e
+                if attempt < self.MAX_RETRIES - 1:
+                    wait = min(self.RETRY_BASE_DELAY * (2 ** attempt), self.RETRY_MAX_DELAY)
+                    wait += random.uniform(0, 1)
+                    logger.debug("GET %s → network error, retry in %.1fs (attempt %d/%d): %s",
+                                 endpoint, wait, attempt + 1, self.MAX_RETRIES, e)
+                    time.sleep(wait)
+                    continue
+                # Final attempt failed — return error dict
+                return {"code": -1, "message": str(e)}
+
+        # Should not reach here, but in case
+        return {"code": -1, "message": str(last_exception)}
 
     def _post(self, endpoint: str, body: dict) -> dict:
-        """POST request to v3.0 API."""
+        """POST request to v3.0 API with retry support."""
         url = f"{API_BASE_V3}{endpoint}"
         data = json.dumps(body).encode("utf-8")
 
-        req = urllib.request.Request(url, data=data)
-        req.add_header("Access-Token", self.auth.get_token())
-        req.add_header("Content-Type", "application/json")
-
-        try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            body_text = e.read().decode() if e.fp else str(e)
+        last_exception = None
+        for attempt in range(self.MAX_RETRIES):
             try:
-                return json.loads(body_text)
-            except Exception:
-                return {"code": e.code, "message": body_text}
+                req = urllib.request.Request(url, data=data)
+                req.add_header("Access-Token", self.auth.get_token())
+                req.add_header("Content-Type", "application/json")
+
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+
+            except urllib.error.HTTPError as e:
+                body_text = e.read().decode() if e.fp else str(e)
+                try:
+                    result = json.loads(body_text)
+                except Exception:
+                    result = {"code": e.code, "message": body_text}
+
+                if e.code in self.RETRYABLE_HTTP_CODES and attempt < self.MAX_RETRIES - 1:
+                    wait = min(self.RETRY_BASE_DELAY * (2 ** attempt), self.RETRY_MAX_DELAY)
+                    wait += random.uniform(0, 1)
+                    logger.debug("POST %s → HTTP %d, retry in %.1fs (attempt %d/%d)",
+                                 endpoint, e.code, wait, attempt + 1, self.MAX_RETRIES)
+                    time.sleep(wait)
+                    last_exception = e
+                    continue
+                return result
+
+            except (urllib.error.URLError, OSError, TimeoutError) as e:
+                last_exception = e
+                if attempt < self.MAX_RETRIES - 1:
+                    wait = min(self.RETRY_BASE_DELAY * (2 ** attempt), self.RETRY_MAX_DELAY)
+                    wait += random.uniform(0, 1)
+                    logger.debug("POST %s → network error, retry in %.1fs (attempt %d/%d): %s",
+                                 endpoint, wait, attempt + 1, self.MAX_RETRIES, e)
+                    time.sleep(wait)
+                    continue
+                return {"code": -1, "message": str(e)}
+
+        return {"code": -1, "message": str(last_exception)}
 
     # ── Account Discovery ─────────────────────────────────────
 
@@ -201,23 +325,41 @@ class OceanEngineClient:
         return valid
 
     def _get_v2(self, endpoint: str, params: dict) -> dict:
-        """GET request to v2 API (e.g. advertiser/fund/get/)."""
+        """GET request to v2 API (e.g. advertiser/fund/get/) with retry support."""
         query_string = "&".join(
             f"{k}={urllib.parse.quote(str(v))}" for k, v in params.items()
         )
         url = f"{API_BASE_V2}{endpoint}?{query_string}"
 
-        req = urllib.request.Request(url)
-        req.add_header("Access-Token", self.auth.get_token())
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            body = e.read().decode() if e.fp else str(e)
+        last_exception = None
+        for attempt in range(self.MAX_RETRIES):
             try:
-                return json.loads(body)
-            except Exception:
-                return {"code": e.code, "message": body}
+                req = urllib.request.Request(url)
+                req.add_header("Access-Token", self.auth.get_token())
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                body = e.read().decode() if e.fp else str(e)
+                try:
+                    result = json.loads(body)
+                except Exception:
+                    result = {"code": e.code, "message": body}
+                if e.code in self.RETRYABLE_HTTP_CODES and attempt < self.MAX_RETRIES - 1:
+                    wait = min(self.RETRY_BASE_DELAY * (2 ** attempt), self.RETRY_MAX_DELAY)
+                    wait += random.uniform(0, 1)
+                    time.sleep(wait)
+                    last_exception = e
+                    continue
+                return result
+            except (urllib.error.URLError, OSError, TimeoutError) as e:
+                last_exception = e
+                if attempt < self.MAX_RETRIES - 1:
+                    wait = min(self.RETRY_BASE_DELAY * (2 ** attempt), self.RETRY_MAX_DELAY)
+                    wait += random.uniform(0, 1)
+                    time.sleep(wait)
+                    continue
+                return {"code": -1, "message": str(e)}
+        return {"code": -1, "message": str(last_exception)}
 
     def _get_account_name(self, account_id: str) -> str:
         """Get account name via v2 advertiser/fund/get/ API.
@@ -265,30 +407,79 @@ class OceanEngineClient:
 
     # ── Account-Level Report ──────────────────────────────────
 
+    def _build_report_filtering(
+        self,
+        campaign_type: str | None = None,
+        marketing_goal: str | None = None,
+        local_delivery_scene: str | None = None,
+        delivery_mode: str | None = None,
+        external_action: str | None = None,
+        **extra,
+    ) -> str | None:
+        """Build filtering JSON for report APIs.
+
+        Args:
+            campaign_type: 'GENERAL' (通投) | 'SEARCHING' (搜索)
+            marketing_goal: 'LIVE' (直播) | 'VIDEO_IMAGE' (短视频/图文)
+            local_delivery_scene: 投放场景
+            delivery_mode: 'AUTO' (自动投放) | 'MANUAL' (手动投放)
+            external_action: 优化目标
+        """
+        parts: dict = {k: v for k, v in extra.items() if v is not None}
+        if campaign_type is not None:
+            parts["campaign_type"] = campaign_type
+        if marketing_goal is not None:
+            parts["marketing_goal"] = marketing_goal
+        if local_delivery_scene is not None:
+            parts["local_delivery_scene"] = local_delivery_scene
+        if delivery_mode is not None:
+            parts["delivery_mode"] = delivery_mode
+        if external_action is not None:
+            parts["external_action"] = external_action
+        return json.dumps(parts) if parts else None
+
     def get_account_report(
         self,
         account_id: str,
         start_date: str,
         end_date: str,
         metrics: list[str] | None = None,
-        page_size: int = 50,
+        page_size: int = 100,
+        time_granularity: str | None = None,
         campaign_type: str | None = None,
+        marketing_goal: str | None = None,
+        local_delivery_scene: str | None = None,
+        delivery_mode: str | None = None,
+        external_action: str | None = None,
     ) -> list[dict]:
         """
         Get daily account-level aggregated report.
 
-        Uses the working endpoint: GET /v3.0/local/report/account/get/
+        Uses: GET /v3.0/local/report/account/get/
 
         Args:
-            campaign_type: Optional filter. 'GENERAL' for 通投 only,
-                          'SEARCHING' for 搜索 only. None for all (通投+搜索).
+            campaign_type: 'GENERAL' for 通投, 'SEARCHING' for 搜索. None=全部.
+                ⚠️ 必须放在filtering内（顶层传参会被API忽略，文档bug）。
+            marketing_goal: 'LIVE' 直播 | 'VIDEO_IMAGE' 短视频/图文
+            local_delivery_scene: 投放场景细分
+            delivery_mode: 'AUTO' 自动投放 | 'MANUAL' 手动投放
+            external_action: 优化目标
+            time_granularity: 'TIME_GRANULARITY_DAILY' (默认)
+                              'TIME_GRANULARITY_HOURLY' (≤7天)
+                              'TIME_GRANULARITY_TOTAL' (汇总)
 
-        Returns list of daily summary rows with: stat_time_day, stat_cost,
-        show_cnt, click_cnt, ctr, convert_cnt, message_action_cnt,
-        clue_message_count, etc.
+        Returns list of daily summary rows.
         """
         if not metrics:
             metrics = LOCAL_ACCOUNT_METRICS
+
+        filtering = self._build_report_filtering(
+            campaign_type=campaign_type,
+            marketing_goal=marketing_goal,
+            local_delivery_scene=local_delivery_scene,
+            delivery_mode=delivery_mode,
+            external_action=external_action,
+        )
 
         all_rows: list[dict] = []
         page = 1
@@ -302,8 +493,10 @@ class OceanEngineClient:
                 "page_size": page_size,
                 "metrics": metrics,
             }
-            if campaign_type:
-                params["filtering"] = json.dumps({"campaign_type": campaign_type})
+            if time_granularity:
+                params["time_granularity"] = time_granularity
+            if filtering:
+                params["filtering"] = filtering
 
             result = self._get("/local/report/account/get/", params)
 
@@ -312,6 +505,11 @@ class OceanEngineClient:
                     raise RuntimeError(
                         f"Account {account_id} report failed: {result.get('message', result)}"
                     )
+                # Non-page-1 error: warn and stop (partial data returned)
+                logger.warning(
+                    "Account %s report page=%d failed: %s (partial data: %d rows)",
+                    account_id[-8:], page, result.get("message", ""), len(all_rows),
+                )
                 break
 
             rows = result.get("data", {}).get("data_list", [])
@@ -334,6 +532,7 @@ class OceanEngineClient:
         metrics: list[str] | None = None,
         max_days_per_batch: int = 30,
         campaign_type: str | None = None,
+        time_granularity: str | None = None,
     ) -> list[dict]:
         """Get account reports for a wide date range, auto-batching."""
         all_rows: list[dict] = []
@@ -346,6 +545,7 @@ class OceanEngineClient:
                 batch_end.strftime("%Y-%m-%d"),
                 metrics=metrics,
                 campaign_type=campaign_type,
+                time_granularity=time_granularity,
             )
             all_rows.extend(rows)
             current = batch_end + timedelta(days=1)
@@ -359,39 +559,63 @@ class OceanEngineClient:
         start_date: str,
         end_date: str,
         metrics: list[str] | None = None,
-        page_size: int = 50,
+        page_size: int = 100,
+        time_granularity: str | None = None,
+        campaign_type: str | None = None,
+        marketing_goal: str | None = None,
+        local_delivery_scene: str | None = None,
     ) -> list[dict]:
         """
         Get promotion-level report (drilled down by promotion/project).
 
         Uses: GET /v3.0/local/report/promotion/get/
 
+        Args:
+            campaign_type: 'GENERAL' (通投) | 'SEARCHING' (搜索) | None (全部)
+            marketing_goal: 'LIVE' (直播) | 'VIDEO_IMAGE' (短视频/图文)
+
         Note: dimensions (promotion_id, project_id, stat_time_day, etc.)
         are automatically returned by the API — no "dimensions" param needed.
         """
         metrics = metrics or LOCAL_PROMOTION_METRICS
 
+        filtering = self._build_report_filtering(
+            campaign_type=campaign_type,
+            marketing_goal=marketing_goal,
+            local_delivery_scene=local_delivery_scene,
+        )
+
         all_rows: list[dict] = []
         page = 1
 
         while True:
-            result = self._get("/local/report/promotion/get/", {
+            params: dict = {
                 "local_account_id": int(account_id),
                 "start_date": start_date,
                 "end_date": end_date,
                 "page": page,
                 "page_size": page_size,
                 "metrics": metrics,
-            })
+            }
+            if time_granularity:
+                params["time_granularity"] = time_granularity
+            if filtering:
+                params["filtering"] = filtering
+
+            result = self._get("/local/report/promotion/get/", params)
 
             if result.get("code") != 0:
                 if page == 1:
                     raise RuntimeError(
                         f"Promotion report failed: {result.get('message', result)}"
                     )
+                logger.warning(
+                    "Promotion report page=%d failed: %s (partial: %d rows)",
+                    page, result.get("message", ""), len(all_rows),
+                )
                 break
 
-            # Promotion report uses "promotion_list" (not "data_list" like account reports)
+            # Promotion report uses "promotion_list" (not "data_list")
             rows = result.get("data", {}).get("promotion_list", [])
             if not rows:
                 break
@@ -412,8 +636,16 @@ class OceanEngineClient:
         start_date: str,
         end_date: str,
         metrics: list[str] | None = None,
-        page_size: int = 50,
+        page_size: int = 100,
+        time_granularity: str | None = None,
+        campaign_type: str | None = None,
+        marketing_goal: str | None = None,
+        local_delivery_scene: str | None = None,
+        delivery_mode: str | None = None,
+        external_action: str | None = None,
         promotion_ids: list[str] | None = None,
+        material_ids: list[str] | None = None,
+        material_type: str | None = None,
     ) -> list[dict]:
         """
         Get material-level (creative) report.
@@ -421,15 +653,29 @@ class OceanEngineClient:
         Uses: GET /v3.0/local/report/material/get/
 
         Args:
+            campaign_type: 'GENERAL' (通投) | 'SEARCHING' (搜索) | None (全部)
+            marketing_goal: 'LIVE' (直播) | 'VIDEO_IMAGE' (短视频/图文)
+            local_delivery_scene: 投放场景
+            delivery_mode: 'AUTO' (自动投放) | 'MANUAL' (手动投放)
+            external_action: 优化目标
             promotion_ids: Optional list of promotion IDs to filter by.
-                When provided, only returns materials used in those promotions.
-                This enables material→promotion linkage (SDK v1.34.1 new feature).
-
-        Returns list of material rows with: material_id, material_name,
-        material_type, stat_cost, show_cnt, click_cnt, ctr, convert_cnt,
-        message_action_cnt, clue_message_count, stat_time_day.
+                Enables material→promotion linkage (SDK v1.34.1).
+            material_ids: Optional list of material IDs to filter by.
+            material_type: 素材类型过滤
+            time_granularity: 'TIME_GRANULARITY_DAILY'/'HOURLY'/'TOTAL'
         """
         metrics = metrics or LOCAL_ACCOUNT_METRICS
+
+        filtering = self._build_report_filtering(
+            campaign_type=campaign_type,
+            marketing_goal=marketing_goal,
+            local_delivery_scene=local_delivery_scene,
+            delivery_mode=delivery_mode,
+            external_action=external_action,
+            promotion_ids=([int(pid) for pid in promotion_ids] if promotion_ids else None),
+            material_ids=([int(mid) for mid in material_ids] if material_ids else None),
+            material_type=material_type,
+        )
 
         all_rows: list[dict] = []
         page = 1
@@ -443,25 +689,26 @@ class OceanEngineClient:
                 "page_size": max(page_size, 10),  # min 10
                 "metrics": metrics,
             }
-            # Build filtering — support promotion_ids for material→promotion linkage
-            filter_parts: dict = {}
-            if promotion_ids:
-                filter_parts["promotion_ids"] = [int(pid) for pid in promotion_ids]
-            if filter_parts:
-                params["filtering"] = json.dumps(filter_parts)
+            if time_granularity:
+                params["time_granularity"] = time_granularity
+            if filtering:
+                params["filtering"] = filtering
 
             result = self._get("/local/report/material/get/", params)
 
             if result.get("code") != 0:
                 if page == 1:
                     msg = result.get("message", result)
-                    # 40000 = empty data / no materials, not a real error
                     if result.get("code") in (40000,):
                         logger.debug("Account %s material report: %s", account_id[-8:], msg)
                         break
                     raise RuntimeError(
                         f"Material report for {account_id} failed: {msg}"
                     )
+                logger.warning(
+                    "Material report page=%d failed: %s (partial: %d rows)",
+                    page, result.get("message", ""), len(all_rows),
+                )
                 break
 
             rows = result.get("data", {}).get("material_list", [])
@@ -536,19 +783,11 @@ class OceanEngineClient:
     def get_promotion_list(
         self,
         account_id: str,
-        page_size: int = 50,
+        page_size: int = 100,
         status_filter: str | None = None,
     ) -> list[dict]:
         """
         Get promotion (投放单元) list for a local account.
-
-        Args:
-            account_id: Local ad account ID.
-            page_size: Items per page.
-            status_filter: Promotion status filter. One of:
-                - None (default): Only non-deleted promotions.
-                - 'PROMOTION_STATUS_ALL': All promotions including deleted.
-                - 'PROMOTION_STATUS_DELETED': Only deleted promotions.
         """
         all_items: list[dict] = []
         page = 1
@@ -571,9 +810,12 @@ class OceanEngineClient:
                     raise RuntimeError(
                         f"Promotion list failed: {result.get('message', result)}"
                     )
+                logger.warning(
+                    "Promotion list page=%d failed: %s", page, result.get("message", ""),
+                )
                 break
 
-            rows = result.get("data", {}).get("list", [])
+            rows = result.get("data", {}).get("promotion_list", [])
             if not rows:
                 break
 
@@ -589,19 +831,11 @@ class OceanEngineClient:
     def get_project_list(
         self,
         account_id: str,
-        page_size: int = 50,
+        page_size: int = 100,
         status_filter: str | None = None,
     ) -> list[dict]:
         """
         Get project (项目) list for a local account.
-
-        Args:
-            account_id: Local ad account ID.
-            page_size: Items per page.
-            status_filter: Project status filter. One of:
-                - None (default): Only non-deleted projects.
-                - 'PROJECT_STATUS_ALL': All projects including deleted.
-                - 'PROJECT_STATUS_DELETED': Only deleted projects.
         """
         all_items: list[dict] = []
         page = 1
@@ -624,9 +858,12 @@ class OceanEngineClient:
                     raise RuntimeError(
                         f"Project list failed: {result.get('message', result)}"
                     )
+                logger.warning(
+                    "Project list page=%d failed: %s", page, result.get("message", ""),
+                )
                 break
 
-            rows = result.get("data", {}).get("list", [])
+            rows = result.get("data", {}).get("project_list", [])
             if not rows:
                 break
 
@@ -645,12 +882,19 @@ class OceanEngineClient:
         start_date: str,
         end_date: str,
         metrics: list[str] | None = None,
-        page_size: int = 50,
+        page_size: int = 100,
+        time_granularity: str | None = None,
+        campaign_type: str | None = None,
+        marketing_goal: str | None = None,
+        local_delivery_scene: str | None = None,
     ) -> list[dict]:
         """
         Get project-level report.
 
         Uses: GET /v3.0/local/report/project/get/
+
+        Args:
+            campaign_type: 'GENERAL' (通投) | 'SEARCHING' (搜索) | None (全部)
 
         Returns data for ALL projects with spend in the date range,
         including deleted projects (history is preserved).
@@ -660,24 +904,40 @@ class OceanEngineClient:
         """
         metrics = metrics or LOCAL_PROMOTION_METRICS
 
+        filtering = self._build_report_filtering(
+            campaign_type=campaign_type,
+            marketing_goal=marketing_goal,
+            local_delivery_scene=local_delivery_scene,
+        )
+
         all_rows: list[dict] = []
         page = 1
 
         while True:
-            result = self._get("/local/report/project/get/", {
+            params: dict = {
                 "local_account_id": int(account_id),
                 "start_date": start_date,
                 "end_date": end_date,
                 "page": page,
                 "page_size": page_size,
                 "metrics": metrics,
-            })
+            }
+            if time_granularity:
+                params["time_granularity"] = time_granularity
+            if filtering:
+                params["filtering"] = filtering
+
+            result = self._get("/local/report/project/get/", params)
 
             if result.get("code") != 0:
                 if page == 1:
                     raise RuntimeError(
                         f"Project report failed: {result.get('message', result)}"
                     )
+                logger.warning(
+                    "Project report page=%d failed: %s (partial: %d rows)",
+                    page, result.get("message", ""), len(all_rows),
+                )
                 break
 
             # Project report uses "project_list" key

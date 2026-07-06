@@ -219,6 +219,9 @@ class Storage:
         # Migration v1.4: add API-native metric columns to existing tables
         self._migrate_v14(conn)
 
+        # Migration v1.5: add attribution(计费时间) metric columns
+        self._migrate_v15(conn)
+
         conn.commit()
         conn.close()
         logger.info("Database initialized: %s", self.db_path)
@@ -257,7 +260,119 @@ class Storage:
                     except Exception as e:
                         logger.warning("Migration %s.%s failed: %s", table, col_name, e)
 
+    def _migrate_v15(self, conn: sqlite3.Connection):
+        """Add v1.5 expanded metrics: attribution/intention/live/video columns.
+        
+        Full raw API response always stored in raw_data JSON.
+        These columns are the most useful subset for dashboard queries.
+        """
+        additions = {
+            "account_reports": [
+                # 计费时间（与后台UI对齐的核心指标）
+                ("attribution_message_action_cnt", "INTEGER DEFAULT 0"),
+                ("attribution_convert_cnt", "INTEGER DEFAULT 0"),
+                ("attribution_conversion_rate", "REAL DEFAULT 0"),
+                ("attribution_form_cnt", "INTEGER DEFAULT 0"),
+                ("attribution_clue_pay_order_cnt", "INTEGER DEFAULT 0"),
+                # 意向指标
+                ("intention_message_clue_cnt", "INTEGER DEFAULT 0"),
+                ("intention_form_cnt", "INTEGER DEFAULT 0"),
+                ("intention_phone_cnt", "INTEGER DEFAULT 0"),
+                # 直播指标
+                ("luban_live_enter_cnt", "INTEGER DEFAULT 0"),
+                ("live_watch_one_minute_count", "INTEGER DEFAULT 0"),
+                # 视频播放
+                ("play_duration_5s", "INTEGER DEFAULT 0"),
+            ],
+            "promotion_reports": [
+                ("attribution_message_action_cnt", "INTEGER DEFAULT 0"),
+                ("attribution_convert_cnt", "INTEGER DEFAULT 0"),
+                ("attribution_conversion_rate", "REAL DEFAULT 0"),
+                ("attribution_form_cnt", "INTEGER DEFAULT 0"),
+                ("attribution_clue_pay_order_cnt", "INTEGER DEFAULT 0"),
+                ("intention_message_clue_cnt", "INTEGER DEFAULT 0"),
+                ("luban_live_enter_cnt", "INTEGER DEFAULT 0"),
+                ("play_duration_5s", "INTEGER DEFAULT 0"),
+            ],
+            "material_reports": [
+                ("attribution_message_action_cnt", "INTEGER DEFAULT 0"),
+                ("attribution_convert_cnt", "INTEGER DEFAULT 0"),
+                ("attribution_conversion_rate", "REAL DEFAULT 0"),
+                ("attribution_form_cnt", "INTEGER DEFAULT 0"),
+                ("attribution_clue_pay_order_cnt", "INTEGER DEFAULT 0"),
+                ("intention_message_clue_cnt", "INTEGER DEFAULT 0"),
+                ("luban_live_enter_cnt", "INTEGER DEFAULT 0"),
+                ("play_duration_5s", "INTEGER DEFAULT 0"),
+            ],
+            "project_reports": [
+                ("attribution_message_action_cnt", "INTEGER DEFAULT 0"),
+                ("attribution_convert_cnt", "INTEGER DEFAULT 0"),
+                ("attribution_conversion_rate", "REAL DEFAULT 0"),
+                ("attribution_form_cnt", "INTEGER DEFAULT 0"),
+                ("attribution_clue_pay_order_cnt", "INTEGER DEFAULT 0"),
+                ("intention_message_clue_cnt", "INTEGER DEFAULT 0"),
+                ("luban_live_enter_cnt", "INTEGER DEFAULT 0"),
+                ("play_duration_5s", "INTEGER DEFAULT 0"),
+            ],
+        }
+
+        # v1.6: Add promotion/project attribution to material_reports
+        _migrate_v16_cols = {
+            "material_reports": [
+                ("promotion_id", "TEXT DEFAULT ''"),
+                ("promotion_name", "TEXT DEFAULT ''"),
+                ("project_id", "TEXT DEFAULT ''"),
+                ("project_name", "TEXT DEFAULT ''"),
+            ],
+        }
+        for table, cols in _migrate_v16_cols.items():
+            existing = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+            for col_name, col_type in cols:
+                if col_name not in existing:
+                    try:
+                        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_type}")
+                        logger.info("Migration v1.6: added %s.%s %s", table, col_name, col_type)
+                    except Exception as e:
+                        logger.warning("Migration v1.6 %s.%s failed: %s", table, col_name, e)
+        for table, cols in additions.items():
+            existing = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+            for col_name, col_type in cols:
+                if col_name not in existing:
+                    try:
+                        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_type}")
+                        logger.info("Migration v1.5: added %s.%s %s", table, col_name, col_type)
+                    except Exception as e:
+                        logger.warning("Migration v1.5 %s.%s failed: %s", table, col_name, e)
+
+    # v1.5 expanded fields columns (same across all report tables)
+    # These map API response keys → DB column names (identical).
+    V15_INSERT_COLS = [
+        "attribution_message_action_cnt", "attribution_convert_cnt",
+        "attribution_conversion_rate", "attribution_form_cnt",
+        "attribution_clue_pay_order_cnt",
+        "intention_message_clue_cnt",
+        "luban_live_enter_cnt", "play_duration_5s",
+    ]
+    # account_reports has 3 extra v1.5 columns
+    V15_ACCOUNT_EXTRA = ["intention_form_cnt", "intention_phone_cnt", "live_watch_one_minute_count"]
+
+    def _v15_row_values(self, row: dict, extra: list[str] | None = None) -> list:
+        """Extract v1.5 column values from API row."""
+        all_cols = self.V15_INSERT_COLS + (extra or [])
+        return [self._int(row, c) if "cnt" in c else self._float(row, c) for c in all_cols]
+
+    def _v15_col_names(self, extra: list[str] | None = None) -> list[str]:
+        return self.V15_INSERT_COLS + (extra or [])
+
+    def _v15_update_clause(self, extra: list[str] | None = None) -> str:
+        """Generate DO UPDATE SET clause for v1.5 columns."""
+        all_cols = self.V15_INSERT_COLS + (extra or [])
+        return ", ".join(f"{c}=excluded.{c}" for c in all_cols)
+
     def _get_conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
         conn = sqlite3.connect(self.db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         return conn
@@ -311,18 +426,24 @@ class Storage:
         """
         conn = self._get_conn()
         count = 0
+        v15_extra = self.V15_ACCOUNT_EXTRA
+        v15_cols = self._v15_col_names(v15_extra)
+        v15_placeholders = ", ".join(["?"] * len(v15_cols))
+        v15_update = self._v15_update_clause(v15_extra)
         for row in rows:
             try:
+                v15_vals = self._v15_row_values(row, v15_extra)
                 conn.execute(
-                    """
+                    f"""
                     INSERT INTO account_reports (
                         account_id, stat_date, delivery_type,
                         stat_cost, show_cnt, click_cnt, ctr, convert_cnt,
                         cpc_platform, cpm_platform, conversion_cost, conversion_rate, form_cnt,
                         message_action_cnt, clue_message_count,
                         phone_confirm_cnt, phone_connect_cnt, clue_pay_order_cnt,
+                        {', '.join(v15_cols)},
                         cpm, cpc, cpa, cvr, raw_data
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {v15_placeholders}, ?, ?, ?, ?, ?)
                     ON CONFLICT(account_id, stat_date, delivery_type)
                     DO UPDATE SET
                         stat_cost=excluded.stat_cost, show_cnt=excluded.show_cnt,
@@ -338,6 +459,7 @@ class Storage:
                         phone_confirm_cnt=excluded.phone_confirm_cnt,
                         phone_connect_cnt=excluded.phone_connect_cnt,
                         clue_pay_order_cnt=excluded.clue_pay_order_cnt,
+                        {v15_update},
                         cpm=excluded.cpm, cpc=excluded.cpc,
                         cpa=excluded.cpa, cvr=excluded.cvr,
                         raw_data=excluded.raw_data, updated_at=datetime('now')
@@ -361,6 +483,7 @@ class Storage:
                         self._int(row, "phone_confirm_cnt"),
                         self._int(row, "phone_connect_cnt"),
                         self._int(row, "clue_pay_order_cnt"),
+                        *v15_vals,
                         self._calc_cpm(row),
                         self._calc_cpc(row),
                         self._calc_cpa(row),
@@ -553,20 +676,32 @@ class Storage:
     # ── Material Reports ───────────────────────────────────────
 
     def upsert_material_reports(self, account_id: str, rows: list[dict]) -> int:
-        """Insert/update material-level report rows."""
+        """Insert/update material-level report rows.
+
+        Each row dict may contain optional attribution fields:
+          promotion_id, promotion_name, project_id, project_name
+        These are populated when syncing via per-promotion material queries.
+        """
         conn = self._get_conn()
         count = 0
+        v15_cols = self._v15_col_names()
+        v15_placeholders = ", ".join(["?"] * len(v15_cols))
+        v15_update = self._v15_update_clause()
         for row in rows:
             try:
+                v15_vals = self._v15_row_values(row)
                 conn.execute(
-                    """
+                    f"""
                     INSERT INTO material_reports (
                         account_id, material_id, material_name, material_type, stat_date,
                         stat_cost, show_cnt, click_cnt, ctr,
                         cpc_platform, cpm_platform,
                         convert_cnt, conversion_cost, conversion_rate, form_cnt,
-                        message_action_cnt, clue_message_count, raw_data
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        message_action_cnt, clue_message_count,
+                        {', '.join(v15_cols)},
+                        promotion_id, promotion_name, project_id, project_name,
+                        raw_data
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {v15_placeholders}, ?, ?, ?, ?, ?)
                     ON CONFLICT(account_id, material_id, stat_date)
                     DO UPDATE SET
                         material_name=excluded.material_name,
@@ -581,6 +716,15 @@ class Storage:
                         form_cnt=excluded.form_cnt,
                         message_action_cnt=excluded.message_action_cnt,
                         clue_message_count=excluded.clue_message_count,
+                        {v15_update},
+                        promotion_id=CASE WHEN excluded.promotion_id != ''
+                            THEN excluded.promotion_id ELSE material_reports.promotion_id END,
+                        promotion_name=CASE WHEN excluded.promotion_name != ''
+                            THEN excluded.promotion_name ELSE material_reports.promotion_name END,
+                        project_id=CASE WHEN excluded.project_id != ''
+                            THEN excluded.project_id ELSE material_reports.project_id END,
+                        project_name=CASE WHEN excluded.project_name != ''
+                            THEN excluded.project_name ELSE material_reports.project_name END,
                         raw_data=excluded.raw_data
                     """,
                     (
@@ -601,6 +745,11 @@ class Storage:
                         self._int(row, "form_cnt"),
                         self._int(row, "message_action_cnt"),
                         self._int(row, "clue_message_count"),
+                        *v15_vals,
+                        str(row.get("promotion_id", "")),
+                        str(row.get("promotion_name", "")),
+                        str(row.get("project_id", "")),
+                        str(row.get("project_name", "")),
                         json.dumps(row, ensure_ascii=False, default=str),
                     ),
                 )
@@ -614,17 +763,17 @@ class Storage:
     # ── Promotion Reports ─────────────────────────────────────
 
     def upsert_promotion_reports(self, account_id: str, rows: list[dict]) -> int:
-        """Insert/update promotion-level report rows.
-        
-        API response fields (stat_time_day, project_id, etc.) are mapped
-        to the standard DB column names.
-        """
+        """Insert/update promotion-level report rows."""
         conn = self._get_conn()
         count = 0
+        v15_cols = self._v15_col_names()
+        v15_placeholders = ", ".join(["?"] * len(v15_cols))
+        v15_update = self._v15_update_clause()
         for row in rows:
             try:
+                v15_vals = self._v15_row_values(row)
                 conn.execute(
-                    """
+                    f"""
                     INSERT INTO promotion_reports (
                         account_id, promotion_id, promotion_name, promotion_status,
                         project_id, project_name,
@@ -633,8 +782,10 @@ class Storage:
                         stat_cost, show_cnt, click_cnt, ctr,
                         cpc_platform, cpm_platform,
                         convert_cnt, conversion_cost, conversion_rate,
-                        message_action_cnt, clue_message_count, raw_data
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        message_action_cnt, clue_message_count,
+                        {', '.join(v15_cols)},
+                        raw_data
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {v15_placeholders}, ?)
                     ON CONFLICT(account_id, promotion_id, stat_date)
                     DO UPDATE SET
                         promotion_name=excluded.promotion_name,
@@ -652,6 +803,7 @@ class Storage:
                         conversion_rate=excluded.conversion_rate,
                         message_action_cnt=excluded.message_action_cnt,
                         clue_message_count=excluded.clue_message_count,
+                        {v15_update},
                         raw_data=excluded.raw_data
                     """,
                     (
@@ -675,6 +827,7 @@ class Storage:
                         self._float(row, "conversion_rate"),
                         self._int(row, "message_action_cnt"),
                         self._int(row, "clue_message_count"),
+                        *v15_vals,
                         json.dumps(row, ensure_ascii=False, default=str),
                     ),
                 )
@@ -689,24 +842,26 @@ class Storage:
     # ── Project Reports ────────────────────────────────────────
 
     def upsert_project_reports(self, account_id: str, rows: list[dict]) -> int:
-        """Insert/update project-level report rows.
-
-        Uses: data from GET /v3.0/local/report/project/get/
-        Returns project_list rows with stat_time_day, project_id, project_name, etc.
-        """
+        """Insert/update project-level report rows."""
         conn = self._get_conn()
         count = 0
+        v15_cols = self._v15_col_names()
+        v15_placeholders = ", ".join(["?"] * len(v15_cols))
+        v15_update = self._v15_update_clause()
         for row in rows:
             try:
+                v15_vals = self._v15_row_values(row)
                 conn.execute(
-                    """
+                    f"""
                     INSERT INTO project_reports (
                         account_id, project_id, project_name, stat_date,
                         stat_cost, show_cnt, click_cnt, ctr,
                         cpc_platform, cpm_platform,
                         convert_cnt, conversion_cost, conversion_rate,
-                        message_action_cnt, clue_message_count, raw_data
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        message_action_cnt, clue_message_count,
+                        {', '.join(v15_cols)},
+                        raw_data
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {v15_placeholders}, ?)
                     ON CONFLICT(account_id, project_id, stat_date)
                     DO UPDATE SET
                         project_name=excluded.project_name,
@@ -719,6 +874,7 @@ class Storage:
                         conversion_rate=excluded.conversion_rate,
                         message_action_cnt=excluded.message_action_cnt,
                         clue_message_count=excluded.clue_message_count,
+                        {v15_update},
                         raw_data=excluded.raw_data
                     """,
                     (
@@ -737,6 +893,7 @@ class Storage:
                         self._float(row, "conversion_rate"),
                         self._int(row, "message_action_cnt"),
                         self._int(row, "clue_message_count"),
+                        *v15_vals,
                         json.dumps(row, ensure_ascii=False, default=str),
                     ),
                 )
@@ -820,7 +977,12 @@ class Storage:
                 CASE WHEN SUM(m.convert_cnt) > 0 AND SUM(m.stat_cost) > 0
                     THEN ROUND(SUM(m.stat_cost)/SUM(m.convert_cnt), 2) END as cpa,
                 CASE WHEN SUM(m.clue_message_count) > 0 AND SUM(m.stat_cost) > 0
-                    THEN ROUND(SUM(m.stat_cost)/SUM(m.clue_message_count), 2) END as lead_cpa
+                    THEN ROUND(SUM(m.stat_cost)/SUM(m.clue_message_count), 2) END as lead_cpa,
+                -- Attribution fields (v1.6): take most common non-empty value
+                MAX(m.promotion_id) as promotion_id,
+                MAX(CASE WHEN m.promotion_id != '' THEN m.promotion_name END) as promotion_name,
+                MAX(m.project_id) as project_id,
+                MAX(CASE WHEN m.project_id != '' THEN m.project_name END) as project_name
             FROM material_reports m
             LEFT JOIN accounts a ON m.account_id = a.account_id
             WHERE {where}
@@ -856,7 +1018,11 @@ class Storage:
                 CASE WHEN SUM(m.convert_cnt) > 0 AND SUM(m.stat_cost) > 0
                     THEN ROUND(SUM(m.stat_cost)/SUM(m.convert_cnt), 2) END as cpa,
                 CASE WHEN SUM(m.clue_message_count) > 0 AND SUM(m.stat_cost) > 0
-                    THEN ROUND(SUM(m.stat_cost)/SUM(m.clue_message_count), 2) END as lead_cpa
+                    THEN ROUND(SUM(m.stat_cost)/SUM(m.clue_message_count), 2) END as lead_cpa,
+                MAX(CASE WHEN m.promotion_id != '' THEN m.promotion_id END) as promotion_id,
+                MAX(CASE WHEN m.promotion_id != '' THEN m.promotion_name END) as promotion_name,
+                MAX(CASE WHEN m.project_id != '' THEN m.project_id END) as project_id,
+                MAX(CASE WHEN m.project_id != '' THEN m.project_name END) as project_name
             FROM material_reports m
             LEFT JOIN accounts a ON m.account_id = a.account_id
             WHERE m.stat_date BETWEEN ? AND ?

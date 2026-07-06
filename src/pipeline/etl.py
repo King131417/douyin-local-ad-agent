@@ -89,15 +89,15 @@ class ETLPipeline:
 
         logger.info("=== Daily sync complete: %d/%d accounts ===", len(results), len(account_ids))
 
-        # Sync material-level data
-        material_results = self._sync_materials(date_str, account_ids)
-        total_materials = sum(material_results.values())
-        logger.info("=== Material sync: %d materials across %d accounts ===", total_materials, len(material_results))
-
-        # Sync promotion-level data
+        # Sync promotion-level data first (material sync needs promotion list)
         promo_results = self._sync_promotions(date_str, account_ids)
         total_promos = sum(promo_results.values())
         logger.info("=== Promotion sync: %d promotions across %d accounts ===", total_promos, len(promo_results))
+
+        # Sync material-level data (uses promotion info for attribution)
+        material_results = self._sync_materials(date_str, account_ids)
+        total_materials = sum(material_results.values())
+        logger.info("=== Material sync: %d materials across %d accounts ===", total_materials, len(material_results))
 
         # Sync project-level data
         project_results = self._sync_projects(date_str, account_ids)
@@ -128,6 +128,8 @@ class ETLPipeline:
     ) -> dict[str, int]:
         """
         Sync material-level data for all accounts on a given date.
+        Uses per-promotion queries to capture project/promotion attribution.
+        Falls back to bulk query if no promotions found.
         Returns {account_id: material_count}.
         """
         logger.info("=== Syncing material data for %s ===", date_str)
@@ -135,10 +137,9 @@ class ETLPipeline:
 
         for i, aid in enumerate(account_ids):
             try:
-                rows = self.client.get_material_report(aid, date_str, date_str)
-                if rows:
-                    count = self.storage.upsert_material_reports(aid, rows)
-                    results[aid] = count
+                count = self._sync_account_materials(aid, date_str, date_str)
+                results[aid] = count
+                if count > 0:
                     logger.debug("  [%d/%d] %s: %d materials", i + 1, len(account_ids), aid[-8:], count)
                 else:
                     results[aid] = 0
@@ -148,6 +149,264 @@ class ETLPipeline:
 
         logger.info("=== Material sync done: %d total materials ===", sum(results.values()))
         return results
+
+    def _sync_account_materials(
+        self,
+        account_id: str,
+        start_date: str,
+        end_date: str,
+    ) -> int:
+        """Sync materials for a single account with promotion/project attribution.
+
+        Strategy:
+        1. Get all active promotions for the account via API
+        2. If API returns empty, fall back to promotion_reports table
+        3. Query materials per-promotion (via promotion_ids filter)
+        4. Inject promotion_id/name + project_id/name into each row
+        5. Fall back to bulk query if no promotions at all
+        """
+        total_count = 0
+
+        # Get promotions for this account (API first)
+        try:
+            promotions = self.client.get_promotion_list(account_id, page_size=100)
+        except Exception as e:
+            logger.debug("  Failed to get promotions for %s: %s, using fallback", account_id[-8:], e)
+            promotions = []
+
+        # Fallback: get promotions from already-synced promotion_reports table
+        if not promotions:
+            try:
+                conn = self.storage._get_conn()
+                rows = conn.execute(
+                    """
+                    SELECT DISTINCT promotion_id, promotion_name, project_id, project_name
+                    FROM promotion_reports
+                    WHERE account_id = ? AND stat_date BETWEEN ? AND ?
+                      AND promotion_id != ''
+                    """,
+                    (account_id, start_date, end_date),
+                ).fetchall()
+                promotions = [
+                    {
+                        "promotion_id": r["promotion_id"],
+                        "promotion_name": r["promotion_name"] or "",
+                        "project_id": r["project_id"] or "",
+                        "project_name": r["project_name"] or "",
+                    }
+                    for r in rows
+                ]
+                if promotions:
+                    logger.debug(
+                        "  %s: using %d promotions from DB fallback",
+                        account_id[-8:], len(promotions),
+                    )
+            except Exception as e:
+                logger.debug("  DB fallback for promotions failed: %s", e)
+                promotions = []
+
+        if promotions:
+            # Per-promotion material sync with attribution
+            promo_map = {p["promotion_id"]: p for p in promotions}
+            seen_materials: set[str] = set()  # track (material_id, stat_date) to avoid dup upsert noise
+
+            for promo in promotions:
+                pid = promo.get("promotion_id")
+                pname = promo.get("promotion_name", "")
+                proj_id = promo.get("project_id", "")
+                proj_name = promo.get("project_name", "")
+
+                try:
+                    rows = self.client.get_material_report(
+                        account_id, start_date, end_date,
+                        promotion_ids=[pid],
+                    )
+                    if not rows:
+                        continue
+
+                    # Inject attribution fields into each row
+                    for r in rows:
+                        r["promotion_id"] = str(pid) if pid else ""
+                        r["promotion_name"] = str(pname) if pname else ""
+                        r["project_id"] = str(proj_id) if proj_id else ""
+                        r["project_name"] = str(proj_name) if proj_name else ""
+
+                    count = self.storage.upsert_material_reports(account_id, rows)
+                    total_count += count
+                except Exception as e:
+                    # Per-promotion failures are non-fatal; skip this promotion's materials
+                    logger.debug(
+                        "  Material query failed for promotion %s of %s: %s",
+                        str(pid)[:8], account_id[-8:], e,
+                    )
+                    continue
+
+            # Bulk fallback: also do one unfiltered pass to catch any materials
+            # not covered by individual promotion queries (e.g. deleted promotions)
+            #
+            # IMPORTANT: If per-promotion queries returned 0 materials (all accounts
+            # where API's promotion_ids filter is unsupported), inject attribution
+            # from promotions. For single-promotion accounts, attribute all bulk
+            # materials to that promotion. For multi-promotion accounts, the API
+            # natively returns promotion_id/promotion_name/project_id but NOT
+            # project_name — look it up from promotion_reports table.
+            try:
+                bulk_rows = self.client.get_material_report(account_id, start_date, end_date)
+                if bulk_rows:
+                    if total_count == 0 and len(promotions) == 1:
+                        # Single-promotion account: promotion_ids filter returned 0;
+                        # attribute all bulk materials to the only promotion.
+                        p = promotions[0]
+                        pid = p.get("promotion_id", "")
+                        pname = p.get("promotion_name", "")
+                        proj_id = p.get("project_id", "")
+                        proj_name = p.get("project_name", "")
+                        for r in bulk_rows:
+                            r["promotion_id"] = str(pid)
+                            r["promotion_name"] = str(pname)
+                            r["project_id"] = str(proj_id)
+                            r["project_name"] = str(proj_name)
+                    elif total_count == 0 and len(promotions) > 1:
+                        # Multi-promotion account with failed per-promo queries.
+                        # The API natively returns promotion_id/promotion_name/project_id
+                        # but NOT project_name. Build a lookup from promotion_reports
+                        # (all dates for this account) to fill in project_name.
+                        self._enrich_project_name(account_id, bulk_rows)
+
+                    # Always enrich: even per-promotion path may have bulk rows
+                    # with API-returned promotion_id but missing project_name
+                    self._enrich_project_name(account_id, bulk_rows)
+
+                    count = self.storage.upsert_material_reports(account_id, bulk_rows)
+                    total_count += count
+            except Exception as e:
+                logger.debug("  Bulk material fallback for %s: %s", account_id[-8:], e)
+
+        else:
+            # No promotions — fall back to original bulk behavior
+            rows = self.client.get_material_report(account_id, start_date, end_date)
+            if rows:
+                total_count = self.storage.upsert_material_reports(account_id, rows)
+
+        return total_count
+
+    def _enrich_project_name(self, account_id: str, rows: list[dict]) -> None:
+        """Fill in missing project_name by looking up promotion_id/project_id
+        in promotion_reports and project_reports tables (all dates).
+
+        The material report API returns promotion_id, promotion_name, and
+        project_id natively, but NEVER returns project_name. This method
+        fills that gap by cross-referencing with other report tables.
+
+        Modifies rows in-place.
+        """
+        # Collect promotion_ids and project_ids that need lookup
+        promo_ids_need_lookup = set()
+        proj_ids_need_lookup = set()
+        for r in rows:
+            proj_name = str(r.get("project_name", "") or "")
+            if not proj_name:
+                pid = str(r.get("promotion_id", "") or "")
+                if pid:
+                    promo_ids_need_lookup.add(pid)
+                proj_id = str(r.get("project_id", "") or "")
+                if proj_id:
+                    proj_ids_need_lookup.add(proj_id)
+
+        if not promo_ids_need_lookup and not proj_ids_need_lookup:
+            return  # all rows already have project_name
+
+        # Build lookup maps from DB (all dates for this account)
+        conn = self.storage._get_conn()
+
+        # Map: promotion_id -> project_name (from promotion_reports, any date)
+        promo_to_proj_name: dict[str, str] = {}
+        if promo_ids_need_lookup:
+            placeholders = ",".join(["?"] * len(promo_ids_need_lookup))
+            db_rows = conn.execute(
+                f"""
+                SELECT DISTINCT promotion_id, project_name
+                FROM promotion_reports
+                WHERE account_id = ? AND promotion_id IN ({placeholders})
+                  AND project_name IS NOT NULL AND project_name != ''
+                """,
+                (account_id, *promo_ids_need_lookup),
+            ).fetchall()
+            for dr in db_rows:
+                promo_to_proj_name[str(dr["promotion_id"])] = dr["project_name"]
+
+        # Map: project_id -> project_name (from project_reports, any date)
+        proj_id_to_name: dict[str, str] = {}
+        if proj_ids_need_lookup:
+            placeholders = ",".join(["?"] * len(proj_ids_need_lookup))
+            db_rows = conn.execute(
+                f"""
+                SELECT DISTINCT project_id, project_name
+                FROM project_reports
+                WHERE account_id = ? AND project_id IN ({placeholders})
+                  AND project_name IS NOT NULL AND project_name != ''
+                """,
+                (account_id, *proj_ids_need_lookup),
+            ).fetchall()
+            for dr in db_rows:
+                proj_id_to_name[str(dr["project_id"])] = dr["project_name"]
+
+        # Also check promotion_reports for project_id -> project_name
+        if proj_ids_need_lookup:
+            still_missing = proj_ids_need_lookup - set(proj_id_to_name.keys())
+            if still_missing:
+                placeholders = ",".join(["?"] * len(still_missing))
+                db_rows = conn.execute(
+                    f"""
+                    SELECT DISTINCT project_id, project_name
+                    FROM promotion_reports
+                    WHERE account_id = ? AND project_id IN ({placeholders})
+                      AND project_name IS NOT NULL AND project_name != ''
+                    """,
+                    (account_id, *still_missing),
+                ).fetchall()
+                for dr in db_rows:
+                    proj_id_to_name[str(dr["project_id"])] = dr["project_name"]
+
+        conn.close()
+
+        if not promo_to_proj_name and not proj_id_to_name:
+            return  # no lookup data available
+
+        # Apply lookups to rows
+        enriched = 0
+        for r in rows:
+            proj_name = str(r.get("project_name", "") or "")
+            if proj_name:
+                continue  # already has project_name
+
+            # Try promotion_id -> project_name first
+            pid = str(r.get("promotion_id", "") or "")
+            if pid and pid in promo_to_proj_name:
+                r["project_name"] = promo_to_proj_name[pid]
+                enriched += 1
+                continue
+
+            # Try project_id -> project_name
+            proj_id = str(r.get("project_id", "") or "")
+            if proj_id and proj_id in proj_id_to_name:
+                r["project_name"] = proj_id_to_name[proj_id]
+                enriched += 1
+                continue
+
+            # Fallback: if promotion_name is available but project_name is not,
+            # use promotion_name as project_name (for deleted/old promotions
+            # where the project has been removed from the system)
+            promo_name = str(r.get("promotion_name", "") or "")
+            if promo_name and pid:
+                r["project_name"] = promo_name
+                enriched += 1
+
+        if enriched:
+            logger.debug(
+                "  %s: enriched %d materials with project_name from DB lookup",
+                account_id[-8:], enriched,
+            )
 
     def _sync_promotions(
         self,
@@ -271,13 +530,13 @@ class ETLPipeline:
 
         logger.info("Account reports: %d rows total", total_rows)
 
-        # Step 2: Sync material-level reports (date range API)
-        total_mat = self._batch_sync("material", date_str_start, date_str_end, account_ids)
-
-        # Step 3: Sync promotion-level reports (date range API)
+        # Step 2: Sync promotion-level reports first (material sync needs promotion list)
         total_promo = self._batch_sync("promotion", date_str_start, date_str_end, account_ids)
 
-        # Step 4: Sync project-level reports (date range API)
+        # Step 3: Sync material-level reports (uses promotion info for attribution)
+        total_mat = self._batch_sync("material", date_str_start, date_str_end, account_ids)
+
+        # Step 4: Sync project-level reports
         total_project = self._batch_sync("project", date_str_start, date_str_end, account_ids)
 
         # Step 5: Refresh account names
@@ -318,25 +577,35 @@ class ETLPipeline:
             for attempt in range(MAX_RETRIES):
                 try:
                     if report_type == "material":
-                        rows = self.client.get_material_report(aid, start_date, end_date)
+                        # Use per-promotion sync with attribution
+                        count = self._sync_account_materials(aid, start_date, end_date)
+                        grand_total += count
+                        if count > 0:
+                            logger.info("  [%d/%d] %s: %d %s(s)",
+                                        i + 1, total, aid[-8:], count, label)
+                        else:
+                            logger.debug("  [%d/%d] %s: no %s data",
+                                         i + 1, total, aid[-8:], label)
                     elif report_type == "project":
                         rows = self.client.get_project_report(aid, start_date, end_date)
+                        if rows:
+                            count = self.storage.upsert_project_reports(aid, rows)
+                            grand_total += count
+                            logger.info("  [%d/%d] %s: %d %s(s)",
+                                        i + 1, total, aid[-8:], count, label)
+                        else:
+                            logger.debug("  [%d/%d] %s: no %s data",
+                                         i + 1, total, aid[-8:], label)
                     else:
                         rows = self.client.get_promotion_report(aid, start_date, end_date)
-
-                    if rows:
-                        if report_type == "material":
-                            count = self.storage.upsert_material_reports(aid, rows)
-                        elif report_type == "project":
-                            count = self.storage.upsert_project_reports(aid, rows)
-                        else:
+                        if rows:
                             count = self.storage.upsert_promotion_reports(aid, rows)
-                        grand_total += count
-                        logger.info("  [%d/%d] %s: %d %s(s)",
-                                    i + 1, total, aid[-8:], count, label)
-                    else:
-                        logger.debug("  [%d/%d] %s: no %s data",
-                                     i + 1, total, aid[-8:], label)
+                            grand_total += count
+                            logger.info("  [%d/%d] %s: %d %s(s)",
+                                        i + 1, total, aid[-8:], count, label)
+                        else:
+                            logger.debug("  [%d/%d] %s: no %s data",
+                                         i + 1, total, aid[-8:], label)
                     success = True
                     break  # success, no retry needed
                 except Exception as e:

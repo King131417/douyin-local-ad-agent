@@ -195,6 +195,10 @@ body::before {
 .a-name { flex:1; min-width:100px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .a-account { font-size:11px; color:var(--cyan); white-space:nowrap; max-width:90px; overflow:hidden; text-overflow:ellipsis; }
 .a-meta { font-size:11px; color:var(--text3); white-space:nowrap; }
+.a-attribution { flex-basis:100%; font-size:10px; color:var(--text3); padding-left:2px; margin-top:1px; }
+.a-attribution .tag { display:inline-block; background:rgba(255,255,255,.04); padding:1px 5px; border-radius:3px; margin-right:4px; font-size:10px; }
+.a-attribution .tag.proj { color:var(--amber); }
+.a-attribution .tag.promo { color:var(--cyan); }
 
 /* ── Tables ── */
 .tbl-wrap { overflow-x:auto; max-height:65vh; overflow-y:auto; }
@@ -250,10 +254,37 @@ td.action-watch { color:var(--text3); }
 .sug-card.high { border-left:3px solid var(--rose); }
 .sug-card.medium { border-left:3px solid var(--amber); }
 .sug-card .sug-title { font-size:14px; font-weight:600; margin-bottom:6px; }
-.sug-card .sug-body { font-size:13px; color:var(--text2); line-height:1.6; }
+.sug-card .sug-body { font-size:13px; color:var(--text2); line-height:1.6; margin-bottom:10px; }
 .sug-priority { display:inline-block; padding:2px 8px; border-radius:4px; font-size:10px; font-weight:600; margin-bottom:8px; }
 .sug-priority.high { background:rgba(244,63,94,.12); color:var(--rose); }
 .sug-priority.medium { background:rgba(245,158,11,.12); color:var(--amber); }
+
+/* ── Suggestion materials table ── */
+.sug-expand-btn { display:inline-flex;align-items:center;gap:4px;font-size:12px;color:var(--cyan);cursor:pointer;margin-bottom:8px;transition:color .2s; }
+.sug-expand-btn:hover { color:var(--sky); }
+.sug-expand-btn svg { width:12px;height:12px;transition:transform .2s; }
+.sug-expand-btn.open svg { transform:rotate(180deg); }
+.sug-mat-list { display:none; }
+.sug-mat-list.open { display:block; }
+.sug-mat-table { width:100%; border-collapse:collapse; font-size:12px; }
+.sug-mat-table th { text-align:left; padding:6px 4px; color:var(--text3); font-weight:500; font-size:11px; border-bottom:1px solid var(--border); white-space:nowrap; }
+.sug-mat-table td { padding:6px 4px; border-bottom:1px solid rgba(148,163,184,.08); vertical-align:middle; }
+.sug-mat-table tr:hover td { background:rgba(56,189,248,.04); }
+.sug-mat-table .mat-id { font-family:var(--mono); font-size:11px; color:var(--cyan); cursor:pointer; white-space:nowrap; }
+.sug-mat-table .mat-id:hover { text-decoration:underline; }
+.sug-mat-table .mat-name { max-width:160px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.sug-mat-table .mat-tag { display:inline-block; padding:1px 5px; border-radius:3px; font-size:10px; white-space:nowrap; max-width:90px; overflow:hidden; text-overflow:ellipsis; }
+.sug-mat-table .mat-tag.proj { background:rgba(245,158,11,.12); color:var(--amber); }
+.sug-mat-table .mat-tag.promo { background:rgba(56,189,248,.12); color:var(--cyan); }
+.sug-mat-table .mat-metric { font-family:var(--mono); font-size:11px; color:var(--text1); white-space:nowrap; }
+.sug-mat-table .mat-metric.negative { color:var(--rose); }
+.sug-mat-table .mat-metric.positive { color:var(--emerald); }
+.sug-action-list { margin-top:10px; padding-top:10px; border-top:1px solid var(--border); }
+.sug-action-list .sug-action-title { font-size:11px; font-weight:600; color:var(--text3); margin-bottom:6px; }
+.sug-action-item { display:flex; align-items:flex-start; gap:8px; font-size:12px; color:var(--text2); margin-bottom:4px; }
+.sug-action-item .sug-action-num { flex-shrink:0; width:18px; height:18px; display:flex; align-items:center; justify-content:center; border-radius:50%; background:var(--bg2); font-size:10px; font-weight:600; color:var(--text3); }
+.sug-action-item .sug-action-text { padding-top:1px; }
+.sug-quantified { display:inline-block; margin-top:8px; padding:3px 10px; border-radius:4px; font-size:11px; font-weight:600; background:rgba(16,185,129,.12); color:var(--emerald); }
 
 /* ── Battle List Cards ── */
 .battle-tables { display:flex; flex-direction:column; gap:10px; }
@@ -409,6 +440,9 @@ td.action-watch { color:var(--text3); }
           <option value="">全部账户</option>
         </select>
         <input type="text" id="filterSearch" placeholder="搜索素材名称..." oninput="applyRankingFilter()">
+        <label style="font-size:11px;color:var(--text2);cursor:pointer;margin-left:6px;">
+          <input type="checkbox" id="filterShowDeleted" onchange="applyRankingFilter()" style="margin-right:3px;cursor:pointer;">显示已删除
+        </label>
         <span style="font-size:11px;color:var(--text3);" id="filterCount"></span>
       </div>
       <div class="tbl-wrap" id="rankingTable"></div>
@@ -650,6 +684,7 @@ const S = {
   charts: {},
   sortCol: null, sortDir: null,
   promoSortCol: null, promoSortDir: null, projSortCol: null, projSortDir: null,
+  adSortCol: null, adSortDir: null,
   reportData: null, reportAccountId: null,
 };
 
@@ -834,12 +869,21 @@ function buildActionItems(list, defaultBadge) {
     const badge = m.action_label||(m.action==='abandon'?'淘汰':defaultBadge);
     const cls = m.action==='abandon'?'abandon':(m.action==='scale_up'?'scale':'pause');
     const mid = (m.material_id||m.id||'').replace(/'/g,"\\'");
+    const pj = m.project_name || m.project_id || '';
+    const pm = m.promotion_name || m.promotion_id || '';
+    const attr = (pj || pm)
+      ? `<span class="a-attribution">
+          ${pj ? `<span class="tag proj" title="项目">${pj.slice(0,18)}</span>` : ''}
+          ${pm ? `<span class="tag promo" title="投放单元">${pm.slice(0,18)}</span>` : ''}
+        </span>`
+      : '';
     return `<div class="action-item clickable-row" onclick="showMaterialDetail('${mid}')">
       <span class="a-badge ${cls}">${badge}</span>
       <span class="a-id" onclick="event.stopPropagation();copyText('${mid}')" title="点击复制">${mid.slice(-12)}</span>
       <span class="a-name" title="${(m.material_name||'').replace(/"/g,'&quot;')}">${(m.material_name||'').slice(0,28)}</span>
       <span class="a-account">${m.account_name||(m.account_id||'').slice(-6)}</span>
       <span class="a-meta">花费${F.money(m.total_cost)} CTR${F.pct(m.ctr)} 效率${(m.efficiency_score||0).toFixed(0)}</span>
+      ${attr}
     </div>`;
   }).join('');
 }
@@ -889,12 +933,14 @@ async function toggleMatAcc(header, accountId) {
     const qs = buildQs();
     const data = await fetch('/api/account/'+accountId+qs).then(r=>r.json());
     const mats = data.materials||[];
-    let html = '<table style="margin-top:8px;"><thead><tr><th>素材ID</th><th>素材名称</th><th>消耗</th><th>CTR</th><th>咨询</th><th>留资</th><th>留资率</th><th>效率分</th><th>动作</th></tr></thead><tbody>';
+    let html = '<table style="margin-top:8px;"><thead><tr><th>素材ID</th><th>素材名称</th><th>项目</th><th>单元</th><th>消耗</th><th>CTR</th><th>咨询</th><th>留资</th><th>留咨率</th><th>效率分</th><th>动作</th></tr></thead><tbody>';
     mats.slice(0,20).forEach(m => {
       const mid = (m.material_id||'').replace(/'/g,"\\'");
       html += `<tr class="clickable-row" onclick="showMaterialDetail('${mid}')">
         <td><span class="a-id" onclick="event.stopPropagation();copyText('${mid}')" title="点击复制">${(m.material_id||'').slice(-12)}</span></td>
         <td style="max-width:150px;overflow:hidden;text-overflow:ellipsis;">${m.material_name||''}</td>
+        <td style="max-width:80px;overflow:hidden;text-overflow:ellipsis;color:var(--accent);" title="${m.project_id||''}">${m.project_name||'--'}</td>
+        <td style="max-width:100px;overflow:hidden;text-overflow:ellipsis;color:var(--text2);" title="${m.promotion_id||''}">${m.promotion_name||'--'}</td>
         <td>${F.money(m.total_cost)}</td><td>${F.pct(m.ctr)}</td>
         <td>${m.total_consult||0}</td><td>${m.total_clue||0}</td>
         <td>${F.pct(m.lead_rate)}</td><td>${(m.efficiency_score||0).toFixed(0)}</td>
@@ -913,8 +959,9 @@ function renderRankingTable(filtered) {
   if (!list.length) { document.getElementById('rankingTable').innerHTML='<div style="padding:40px;text-align:center;color:var(--text3);">暂无数据</div>'; return; }
   const cols = [
     {k:'material_id',l:'素材ID'},{k:'material_name',l:'素材名称'},{k:'account_name',l:'账户'},
+    {k:'project_name',l:'项目'},{k:'promotion_name',l:'投放单元'},
     {k:'total_cost',l:'消耗'},{k:'ctr',l:'CTR'},{k:'total_consult',l:'咨询'},
-    {k:'total_clue',l:'留资'},{k:'lead_rate',l:'留资率'},{k:'lead_cpa',l:'转化成本'},
+    {k:'total_clue',l:'留资'},{k:'lead_rate',l:'留咨率'},{k:'lead_cpa',l:'留资成本'},
     {k:'efficiency_score',l:'效率分'},{k:'action',l:'动作'},
   ];
   let html = '<table><thead><tr>' + cols.map(c =>
@@ -925,7 +972,10 @@ function renderRankingTable(filtered) {
     html += `<tr class="clickable-row" onclick="showMaterialDetail('${mid}')">
       <td><span class="a-id" onclick="event.stopPropagation();copyText('${mid}')" title="点击复制">${(m.material_id||'').slice(-12)}</span></td>
       <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;" title="${m.material_name||''}">${m.material_name||'--'}</td>
-      <td>${m.account_name||''}</td><td>${F.money(m.total_cost)}</td><td>${F.pct(m.ctr)}</td>
+      <td>${m.account_name||''}</td>
+      <td style="max-width:100px;overflow:hidden;text-overflow:ellipsis;color:var(--accent);" title="${m.project_id||''}">${m.project_name||'--'}</td>
+      <td style="max-width:120px;overflow:hidden;text-overflow:ellipsis;color:var(--text2);" title="${m.promotion_id||''}">${m.promotion_name||'--'}</td>
+      <td>${F.money(m.total_cost)}</td><td>${F.pct(m.ctr)}</td>
       <td>${m.total_consult||0}</td><td>${m.total_clue||0}</td><td>${F.pct(m.lead_rate)}</td>
       <td>${m.lead_cpa>0?F.money(m.lead_cpa):'--'}</td><td>${(m.efficiency_score||0).toFixed(0)}</td>
       <td class="action-${m.action||'watch'}">${m.action_label||'--'}</td>
@@ -944,7 +994,17 @@ function applyRankingFilter() {
   const action = document.getElementById('filterAction').value;
   const account = document.getElementById('filterAccount').value;
   const search = document.getElementById('filterSearch').value.toLowerCase();
+  const showDeleted = document.getElementById('filterShowDeleted')?.checked;
   let f = S.ranking;
+  // 默认隐藏已删除的素材（promotion_name 或 project_name 为"已删除"）
+  if (!showDeleted) {
+    f = f.filter(m =>
+      m.promotion_name &&
+      m.promotion_name !== '已删除单元' &&
+      m.project_name &&
+      m.project_name !== '已删除项目'
+    );
+  }
   if (action) f = f.filter(m=>m.action===action);
   if (account) f = f.filter(m=>m.account_id===account);
   if (search) f = f.filter(m=>(m.material_name||'').toLowerCase().includes(search)||(m.material_id||'').includes(search));
@@ -974,12 +1034,99 @@ function filterQuadrant(q) {
 function renderSuggestions() {
   const sugs = S.decision?.suggestions||[];
   document.getElementById('sugList').innerHTML = sugs.length
-    ? sugs.map(s=>`<div class="sug-card ${s.priority||'medium'}">
-        <span class="sug-priority ${s.priority||'medium'}">${s.priority==='high'?'高优':'建议'}</span>
-        <div class="sug-title">${s.title||''}</div>
-        <div class="sug-body">${s.body||''}</div>
-      </div>`).join('')
+    ? sugs.map((s, idx) => buildSuggestionCard(s, idx)).join('')
     : '<div style="padding:40px;text-align:center;color:var(--text3);">暂无优化建议</div>';
+}
+
+function buildSuggestionCard(s, idx) {
+  const hasMats = s.materials && s.materials.length > 0;
+  const hasActions = s.action_items && s.action_items.length > 0;
+  
+  // Build material table rows
+  let matRows = '';
+  if (hasMats) {
+    matRows = s.materials.map(m => {
+      const mid = (m.material_id || '').replace(/'/g, "\\'");
+      const mname = (m.material_name || '').replace(/"/g, '&quot;');
+      const proj = m.project_name || m.project_id?.slice(-6) || '--';
+      const promo = m.promotion_name || m.promotion_id?.slice(-6) || '--';
+      const lcpa = m.lead_cpa ? `¥${m.lead_cpa.toFixed(0)}` : '--';
+      const cost = m.total_cost ? `¥${m.total_cost.toFixed(0)}` : '--';
+      const clue = m.total_clue ? m.total_clue.toFixed(0) : '--';
+      const ctr = m.ctr ? (m.ctr * 100).toFixed(1) + '%' : '--';
+      const cpaCls = m.lead_cpa > 50 ? 'negative' : 'positive';
+      return `<tr onclick="showMaterialDetail('${mid}')" style="cursor:pointer">
+        <td><span class="mat-id" onclick="event.stopPropagation();copyText('${mid}')" title="点击复制">${mid.slice(-8)}</span></td>
+        <td class="mat-name" title="${mname}">${m.material_name ? m.material_name.slice(0, 20) : '--'}</td>
+        <td><span class="mat-tag proj" title="${m.project_name || ''}">${proj}</span></td>
+        <td><span class="mat-tag promo" title="${m.promotion_name || ''}">${promo}</span></td>
+        <td class="mat-metric ${cpaCls}">${lcpa}</td>
+        <td class="mat-metric">${cost}</td>
+        <td class="mat-metric">${clue}</td>
+        <td class="mat-metric">${ctr}</td>
+      </tr>`;
+    }).join('');
+  }
+  
+  // Build action items
+  let actionHtml = '';
+  if (hasActions) {
+    actionHtml = `<div class="sug-action-list">
+      <div class="sug-action-title">📝 操作清单</div>
+      ${s.action_items.map((a, i) => `<div class="sug-action-item">
+        <span class="sug-action-num">${i + 1}</span>
+        <span class="sug-action-text">${a}</span>
+      </div>`).join('')}
+    </div>`;
+  }
+  
+  // Quantified impact
+  let quantHtml = '';
+  if (s.quantified) {
+    quantHtml = `<span class="sug-quantified">📈 ${s.quantified}</span>`;
+  }
+  
+  // Expand button
+  let expandHtml = '';
+  let matTableHtml = '';
+  if (hasMats) {
+    expandHtml = `<div class="sug-expand-btn" id="sugExpandBtn${idx}" onclick="toggleSugExpand(${idx})">
+      <span>素材明细 (${s.materials.length}条)</span>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+    </div>`;
+    matTableHtml = `<div class="sug-mat-list" id="sugMatList${idx}">
+      <table class="sug-mat-table">
+        <thead><tr>
+          <th>素材ID</th><th>名称</th><th>项目</th><th>单元</th><th>CPA</th><th>消耗</th><th>留资</th><th>CTR</th>
+        </tr></thead>
+        <tbody>${matRows}</tbody>
+      </table>
+    </div>`;
+  }
+  
+  return `<div class="sug-card ${s.priority||'medium'}">
+    <span class="sug-priority ${s.priority||'medium'}">${s.priority==='high'?'高优':'建议'}</span>
+    <div class="sug-title">${s.title||''}</div>
+    <div class="sug-body">${s.body||''}</div>
+    ${expandHtml}
+    ${matTableHtml}
+    ${actionHtml}
+    ${quantHtml}
+  </div>`;
+}
+
+function toggleSugExpand(idx) {
+  const list = document.getElementById(`sugMatList${idx}`);
+  const btn = document.getElementById(`sugExpandBtn${idx}`);
+  if (!list || !btn) return;
+  const isOpen = list.classList.contains('open');
+  if (isOpen) {
+    list.classList.remove('open');
+    btn.classList.remove('open');
+  } else {
+    list.classList.add('open');
+    btn.classList.add('open');
+  }
 }
 
 // ─────────────────────────────────────────────────
@@ -1021,9 +1168,10 @@ function renderAdGlobalKPI(d) {
     {label:'总消耗', value:F.money(g.cost), sub:`${d.start||''} ~ ${d.end||''}`, color:'#38bdf8'},
     {label:'总展示', value:F.num(g.show), sub:'曝光量', color:'#a78bfa'},
     {label:'总点击', value:F.num(g.click), sub:'CTR '+F.pct(g.ctr), color:'#60a5fa'},
-    {label:'总线索', value:F.num(g.clue), sub:'CPA/线索 '+F.cpa(g.cpa_clue), color:'var(--emerald)'},
-    {label:'总咨询', value:F.num(g.consult), sub:'CPA/咨询 '+F.cpa(g.cpa_consult), color:'var(--amber)'},
-    {label:'总转化', value:F.num(g.convert), sub:'全周期转化', color:'var(--cyan)'},
+    {label:'私信咨询', value:F.num(g.consult), sub:'CPA/咨询 '+F.cpa(g.cpa_consult), color:'var(--amber)'},
+    {label:'私信留资', value:F.num(g.clue), sub:'CPA/留资 '+F.cpa(g.cpa_clue), color:'var(--cyan)'},
+    {label:'留咨率', value:g.consult ? F.pct(g.clue/g.consult*100) : '--', sub:'留资÷咨询', color:'#34d399'},
+    {label:'留资成本', value:F.cpa(g.cpa_clue), sub:'消耗÷留资', color:(g.cpa_clue||0)>0&&(g.cpa_clue||999)<100?'#34d399':'#f59e0b'},
     {label:'活跃账户', value:g.active_accounts||0, sub:'有投放', color:'#94a3b8'},
     {label:'统计天数', value:g.days||0, sub:'统计日数', color:'#64748b'},
   ];
@@ -1052,16 +1200,40 @@ function renderAdPieChart(d) {
 }
 
 function renderAdAccountTable(d) {
-  const accounts = d.accounts||[];
+  let accounts = d.accounts||[];
   const totalCost = d.global?.cost||1;
-  let html = '<table><thead><tr><th>#</th><th>账户名</th><th>消耗</th><th>消耗占比</th><th>线索</th><th>咨询</th><th>转化</th><th>CTR</th><th>CPA/线索</th><th>CPA/咨询</th><th>活跃天</th></tr></thead><tbody>';
+  
+  // 应用排序
+  if (S.adSortCol) {
+    const col = S.adSortCol, dir = S.adSortDir || 'desc';
+    const mul = dir === 'asc' ? 1 : -1;
+    accounts = [...accounts].sort((a,b) => {
+      let av, bv;
+      switch(col) {
+        case 'cost': av = a.cost||0; bv = b.cost||0; break;
+        case 'cost_share': av = a.cost_share||0; bv = b.cost_share||0; break;
+        case 'consult': av = a.consult||0; bv = b.consult||0; break;
+        case 'clue': av = a.clue||0; bv = b.clue||0; break;
+        case 'clue_rate': av = a.consult ? (a.clue||0)/a.consult*100 : 0; bv = b.consult ? (b.clue||0)/b.consult*100 : 0; break;
+        case 'ctr': av = a.ctr||0; bv = b.ctr||0; break;
+        case 'cpa_clue': av = a.cpa_clue||99999; bv = b.cpa_clue||99999; break;
+        case 'cpa_consult': av = a.cpa_consult||99999; bv = b.cpa_consult||99999; break;
+        case 'active_days': av = a.active_days||0; bv = b.active_days||0; break;
+        default: av=0; bv=0;
+      }
+      if (av === bv) return 0;
+      return (av > bv ? 1 : -1) * mul;
+    });
+  }
+  
+  let html = '<table><thead><tr><th>#</th><th>账户名</th><th data-sort="cost" onclick="sortAdAccount(\'cost\')">消耗' + sortIcon('cost') + '</th><th data-sort="cost_share" onclick="sortAdAccount(\'cost_share\')">消耗占比' + sortIcon('cost_share') + '</th><th data-sort="consult" onclick="sortAdAccount(\'consult\')">私信咨询' + sortIcon('consult') + '</th><th data-sort="clue" onclick="sortAdAccount(\'clue\')">私信留资' + sortIcon('clue') + '</th><th data-sort="clue_rate" onclick="sortAdAccount(\'clue_rate\')">留咨率' + sortIcon('clue_rate') + '</th><th data-sort="ctr" onclick="sortAdAccount(\'ctr\')">CTR' + sortIcon('ctr') + '</th><th data-sort="cpa_clue" onclick="sortAdAccount(\'cpa_clue\')">CPA/留资' + sortIcon('cpa_clue') + '</th><th data-sort="cpa_consult" onclick="sortAdAccount(\'cpa_consult\')">CPA/咨询' + sortIcon('cpa_consult') + '</th><th data-sort="active_days" onclick="sortAdAccount(\'active_days\')">活跃天' + sortIcon('active_days') + '</th></tr></thead><tbody>';
   accounts.forEach((a,i) => {
     const bar = `<div class="cost-bar"><div class="cost-bar-bg"><div class="cost-bar-fill" style="width:${Math.min(a.cost_share,100)}%"></div></div><span style="font-size:10px;color:var(--text3);white-space:nowrap;">${a.cost_share}%</span></div>`;
     const cpaCls = a.cpa_clue>0 && a.cpa_clue<100 ? 'good' : (a.cpa_clue>300?'bad':'');
     html += `<tr>
       <td>${i+1}</td><td style="font-weight:600;">${a.account_name}</td>
       <td>${F.money(a.cost)}</td><td>${bar}</td>
-      <td>${F.num(a.clue)}</td><td>${F.num(a.consult)}</td><td>${F.num(a.convert)}</td>
+      <td>${F.num(a.consult)}</td><td>${F.num(a.clue)}</td><td>${a.consult ? F.pct((a.clue||0)/a.consult*100)+'%' : '--'}</td>
       <td>${F.pct(a.ctr)}</td>
       <td class="${cpaCls}">${F.cpa(a.cpa_clue)}</td>
       <td>${F.cpa(a.cpa_consult)}</td>
@@ -1069,6 +1241,20 @@ function renderAdAccountTable(d) {
     </tr>`;
   });
   document.getElementById('adAccountList').innerHTML = html + '</tbody></table>';
+}
+
+function sortAdAccount(col) {
+  if (S.adSortCol === col) {
+    S.adSortDir = S.adSortDir === 'asc' ? 'desc' : 'asc';
+  } else {
+    S.adSortCol = col;
+    S.adSortDir = 'desc';
+  }
+  if (S.adOverview) renderAdAccountTable(S.adOverview);
+}
+function sortIcon(col) {
+  if (S.adSortCol !== col) return ' <span style="color:var(--text3);font-size:10px;opacity:.4;">↕</span>';
+  return S.adSortDir === 'asc' ? ' <span style="color:var(--cyan);font-size:10px;">▲</span>' : ' <span style="color:var(--cyan);font-size:10px;">▼</span>';
 }
 
 // Trend
@@ -1176,9 +1362,9 @@ function renderProjTable(data) {
   if (!data.length) { document.getElementById('projectTable').innerHTML='<div style="padding:40px;text-align:center;color:var(--text3);">暂无数据</div>'; return; }
   const cols = [
     {k:'project_name',l:'项目名称'},{k:'account_name',l:'账户'},
-    {k:'cost',l:'消耗'},{k:'clue',l:'线索'},{k:'consult',l:'咨询'},
-    {k:'convert',l:'转化'},{k:'ctr',l:'CTR'},
-    {k:'cpa_clue',l:'CPA/线索'},{k:'cpa_consult',l:'CPA/咨询'},
+    {k:'cost',l:'消耗'},{k:'consult',l:'咨询'},{k:'clue',l:'留资'},
+    {k:'ctr',l:'CTR'},
+    {k:'cpa_clue',l:'CPA/留资'},{k:'cpa_consult',l:'CPA/咨询'},
     {k:'promo_count',l:'单元数'},{k:'active_days',l:'活跃天'},
   ];
   let html = '<table><thead><tr>' + cols.map(c=>
@@ -1236,8 +1422,8 @@ function renderPromoTable(data) {
   if (!data.length) { document.getElementById('promoTable').innerHTML='<div style="padding:40px;text-align:center;color:var(--text3);">暂无数据</div>'; return; }
   const cols = [
     {k:'promotion_name',l:'单元名称'},{k:'project_name',l:'所属项目'},{k:'account_name',l:'账户'},
-    {k:'cost',l:'消耗'},{k:'clue',l:'线索'},{k:'consult',l:'咨询'},{k:'convert',l:'转化'},
-    {k:'ctr',l:'CTR'},{k:'cpa_clue',l:'CPA/线索'},{k:'cpa_consult',l:'CPA/咨询'},{k:'active_days',l:'天数'},
+    {k:'cost',l:'消耗'},{k:'consult',l:'咨询'},{k:'clue',l:'留资'},
+    {k:'ctr',l:'CTR'},{k:'cpa_clue',l:'CPA/留资'},{k:'cpa_consult',l:'CPA/咨询'},{k:'active_days',l:'天数'},
   ];
   let html = '<table><thead><tr>' + cols.map(c=>
     `<th data-sort="${c.k}" onclick="sortPromo('${c.k}')" class="${promoSortColG===c.k?'sorted':''}">${c.l}<span class="sort-indicator">${promoSortColG===c.k?(promoSortDirG==='asc'?'↑':'↓'):'↕'}</span></th>`
@@ -1284,17 +1470,43 @@ async function showMaterialDetail(materialId) {
     const qs = buildQs();
     const d = await fetch('/api/material/'+materialId+qs).then(r=>r.json());
     document.getElementById('matModalTitle').textContent = '素材详情 · '+(d.material_name||'').slice(0,40);
-    document.getElementById('matModalFields').innerHTML = `
-      <div style="padding:8px;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.2);border-radius:6px;font-size:11px;color:var(--amber);margin-bottom:8px;">
-        ⚠️ 此「报表素材ID」无法直接在后台视频库搜索，请用素材名称搜索或查看对应推广计划
-      </div>
-      <div class="modal-field"><span class="mf-label">报表ID</span><span class="mf-value" style="font-family:monospace;">${d.material_id} <button onclick="copyText('${d.material_id}')" class="sync-btn" style="padding:1px 6px;font-size:10px;">复制</button></span></div>
-      <div class="modal-field"><span class="mf-label">素材名称</span><span class="mf-value">${d.material_name||'--'} <button onclick="copyText('${(d.material_name||'').replace(/'/g,"\\'")}');" class="sync-btn" style="padding:1px 6px;font-size:10px;">复制</button></span></div>
-      <div class="modal-field"><span class="mf-label">类型</span><span class="mf-value">${d.material_type||'--'}</span></div>
-      <div class="modal-field"><span class="mf-label">总消耗</span><span class="mf-value">${F.money(d.totals.cost)}</span></div>
-      <div class="modal-field"><span class="mf-label">总线索</span><span class="mf-value">${d.totals.clue} (转化成本: ${d.totals.clue>0?F.money(d.totals.cost/d.totals.clue):'--'})</span></div>
-      <div class="modal-field"><span class="mf-label">总咨询</span><span class="mf-value">${d.totals.consult}</span></div>
-    `;
+
+    // Build fields HTML progressively (avoid nested template literals)
+    let fh = '';
+    fh += '<div style="padding:8px;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.2);border-radius:6px;font-size:11px;color:var(--amber);margin-bottom:8px;">';
+    fh += '⚠️ 此「报表素材ID」无法直接在后台视频库搜索，请用素材名称搜索或查看对应推广计划</div>';
+
+    fh += '<div class="modal-field"><span class="mf-label">报表ID</span><span class="mf-value" style="font-family:monospace;">'
+      + escHtml(d.material_id) + ' <button onclick="copyText(\'' + escHtml(d.material_id) + '\')" class="sync-btn" style="padding:1px 6px;font-size:10px;">复制</button></span></div>';
+
+    fh += '<div class="modal-field"><span class="mf-label">素材名称</span><span class="mf-value">'
+      + escHtml(d.material_name||'--') + ' <button onclick="copyText(\'' + escHtml(d.material_name||'') + '\')" class="sync-btn" style="padding:1px 6px;font-size:10px;">复制</button></span></div>';
+
+    fh += '<div class="modal-field"><span class="mf-label">类型</span><span class="mf-value">' + escHtml(d.material_type||'--') + '</span></div>';
+
+    if (d.project_id) {
+      fh += '<div class="modal-field"><span class="mf-label" style="color:var(--accent);">所属项目</span><span class="mf-value">'
+        + escHtml(d.project_name||'--');
+      if (d.all_projects && d.all_projects.length > 1) {
+        fh += ' <span style="font-size:10px;color:var(--text3);">(+' + (d.all_projects.length-1) + ')</span>';
+      }
+      fh += ' <button onclick="copyText(\'' + escHtml(d.project_id) + '\')" class="sync-btn" style="padding:1px 6px;font-size:10px;">ID</button></span></div>';
+    }
+
+    if (d.promotion_id) {
+      fh += '<div class="modal-field"><span class="mf-label" style="color:var(--text2);">所属单元</span><span class="mf-value">'
+        + escHtml(d.promotion_name||'--');
+      if (d.all_promotions && d.all_promotions.length > 1) {
+        fh += ' <span style="font-size:10px;color:var(--text3);">(+' + (d.all_promotions.length-1) + ')</span>';
+      }
+      fh += ' <button onclick="copyText(\'' + escHtml(d.promotion_id) + '\')" class="sync-btn" style="padding:1px 6px;font-size:10px;">ID</button></span></div>';
+    }
+
+    fh += '<div class="modal-field"><span class="mf-label">总消耗</span><span class="mf-value">' + F.money(d.totals.cost) + '</span></div>';
+    fh += '<div class="modal-field"><span class="mf-label">总线索</span><span class="mf-value">' + d.totals.clue + ' (留资成本: ' + (d.totals.clue>0?F.money(d.totals.cost/d.totals.clue):'--') + ')</span></div>';
+    fh += '<div class="modal-field"><span class="mf-label">总咨询</span><span class="mf-value">' + d.totals.consult + '</span></div>';
+
+    document.getElementById('matModalFields').innerHTML = fh;
     if (d.daily?.length) {
       const first=d.daily[0].date, last=d.daily[d.daily.length-1].date;
       document.getElementById('matModalDocTitle').textContent = first===last?`${first} 数据`:`${first} ~ ${last} (共${d.daily.length}天)`;
@@ -1367,6 +1579,10 @@ async function triggerBackfill() {
 // ─────────────────────────────────────────────────
 //  Copy
 // ─────────────────────────────────────────────────
+function escHtml(s) {
+  if (!s) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
 function copyText(text) {
   if (navigator.clipboard) navigator.clipboard.writeText(text).catch(()=>{});
   else { const t=document.createElement('textarea'); t.value=text; document.body.appendChild(t); t.select(); document.execCommand('copy'); document.body.removeChild(t); }
@@ -1506,10 +1722,10 @@ function renderReportKpi(kpi) {
     {label:'总消耗', value:F.money(kpi.cost), sub:'', color:'#38bdf8'},
     {label:'总展示', value:F.num(kpi.show), sub:'曝光量', color:'#a78bfa'},
     {label:'总点击', value:F.num(kpi.click), sub:'CTR '+F.pct(kpi.ctr), color:'#60a5fa'},
-    {label:'线索(留资)', value:F.num(kpi.clue), sub:'留资率 '+kpi.lead_rate+'%', color:'#34d399'},
-    {label:'总咨询', value:F.num(kpi.consult), sub:'', color:'#f59e0b'},
-    {label:'总转化', value:F.num(kpi.convert), sub:'全周期', color:'#06b6d4'},
-    {label:'转化成本', value:F.cpa(kpi.lead_cost), sub:'消耗÷留资', color:kpi.lead_cost>0&&kpi.lead_cost<100?'#34d399':'#f59e0b'},
+    {label:'私信咨询', value:F.num(kpi.consult), sub:'', color:'#f59e0b'},
+    {label:'私信留资', value:F.num(kpi.clue), sub:'', color:'#06b6d4'},
+    {label:'留咨率', value:kpi.consult ? F.pct(kpi.clue/kpi.consult*100) : '--', sub:'留资÷咨询', color:'#34d399'},
+    {label:'留资成本', value:F.cpa(kpi.lead_cost), sub:'消耗÷留资', color:kpi.lead_cost>0&&kpi.lead_cost<100?'#34d399':'#f59e0b'},
     {label:'咨询成本', value:F.cpa(kpi.consult_cost), sub:'消耗÷咨询', color:'#94a3b8'},
     {label:'千次展示', value:'¥'+Math.round(kpi.cpm), sub:'CPM', color:'#8b5cf6'},
     {label:'活跃天数', value:kpi.active_days+'天', sub:'有投放天数', color:'#64748b'},
@@ -1558,14 +1774,13 @@ function renderReportProjects(projects) {
     return;
   }
   const totalCost = projects.reduce((s,p) => s + p.cost, 0) || 1;
-  let html = '<table class="report-table"><thead><tr><th>#</th><th>项目名称</th><th class="num">消耗</th><th class="num">占比</th><th class="num">线索</th><th class="num">咨询</th><th class="num">转化</th><th class="num">转化成本</th><th class="num">单元数</th></tr></thead><tbody>';
+  let html = '<table class="report-table"><thead><tr><th>#</th><th>项目名称</th><th class="num">消耗</th><th class="num">占比</th><th class="num">私信咨询</th><th class="num">私信留资</th><th class="num">留资成本</th><th class="num">单元数</th></tr></thead><tbody>';
   projects.forEach((p, i) => {
     const share = (p.cost / totalCost * 100).toFixed(1);
     html += `<tr>
       <td>${i+1}</td><td>${(p.project_name||'').slice(0,35)}</td>
       <td class="num">${F.money(p.cost)}</td><td class="num">${share}%</td>
-      <td class="num">${F.num(p.clue)}</td><td class="num">${F.num(p.consult)}</td>
-      <td class="num">${F.num(p.convert)}</td><td class="num ${p.lead_cost>0&&p.lead_cost<100?'good':''}">${F.cpa(p.lead_cost)}</td>
+      <td class="num">${F.num(p.consult)}</td><td class="num">${F.num(p.clue)}</td><td class="num ${p.lead_cost>0&&p.lead_cost<100?'good':''}">${F.cpa(p.lead_cost)}</td>
       <td class="num">${p.promo_count}</td>
     </tr>`;
   });
@@ -1577,14 +1792,13 @@ function renderReportPromotions(promotions) {
     document.getElementById('reportPromotions').innerHTML = '<div class="empty-hint">暂无投放单元数据</div>';
     return;
   }
-  let html = '<table class="report-table"><thead><tr><th>#</th><th>单元名称</th><th>所属项目</th><th class="num">消耗</th><th class="num">展示</th><th class="num">点击</th><th class="num">线索</th><th class="num">转化</th><th class="num">转化成本</th></tr></thead><tbody>';
+  let html = '<table class="report-table"><thead><tr><th>#</th><th>单元名称</th><th>所属项目</th><th class="num">消耗</th><th class="num">展示</th><th class="num">点击</th><th class="num">私信留资</th><th class="num">留资成本</th></tr></thead><tbody>';
   promotions.forEach((p, i) => {
     html += `<tr>
       <td>${i+1}</td><td title="${(p.promotion_name||'').replace(/"/g,'&quot;')}">${(p.promotion_name||'').slice(0,25)}</td>
       <td>${(p.project_name||'').slice(0,18)}</td>
       <td class="num">${F.money(p.cost)}</td><td class="num">${F.num(p.show)}</td>
       <td class="num">${F.num(p.click)}</td><td class="num">${F.num(p.clue)}</td>
-      <td class="num">${F.num(p.convert)}</td>
       <td class="num ${p.lead_cost>0&&p.lead_cost<100?'good':''}">${F.cpa(p.lead_cost)}</td>
     </tr>`;
   });
@@ -1596,11 +1810,14 @@ function renderReportMaterials(materials) {
     document.getElementById('reportMaterials').innerHTML = '<div class="empty-hint">暂无素材数据</div>';
     return;
   }
-  let html = '<table class="report-table"><thead><tr><th>#</th><th>素材名称</th><th>类型</th><th class="num">消耗</th><th class="num">展示</th><th class="num">线索</th><th>留资率</th><th class="num">转化成本</th></tr></thead><tbody>';
+  let html = '<table class="report-table"><thead><tr><th>#</th><th>素材名称</th><th>类型</th><th>项目</th><th>单元</th><th class="num">消耗</th><th class="num">展示</th><th class="num">私信留资</th><th>留资率</th><th class="num">留资成本</th></tr></thead><tbody>';
   materials.forEach((m, i) => {
-    html += `<tr>
+    const mid = escHtml(m.material_id || '');
+    html += `<tr class="clickable-row" onclick="showMaterialDetail('${mid}')">
       <td>${i+1}</td><td title="${(m.material_name||'').replace(/"/g,'&quot;')}">${(m.material_name||'').slice(0,28)}</td>
       <td>${m.material_type}</td>
+      <td style="color:var(--accent);font-size:11px;">${(m.project_name||'').slice(0,12)||'--'}</td>
+      <td style="color:var(--text2);font-size:11px;">${(m.promotion_name||'').slice(0,14)||'--'}</td>
       <td class="num">${F.money(m.cost)}</td><td class="num">${F.num(m.show)}</td>
       <td class="num">${F.num(m.clue)}</td>
       <td>${(m.lead_rate||0)}%</td>
@@ -1615,7 +1832,13 @@ function exportAccountReport() {
   if (!accountId) return;
   const qs = buildQs();
   const url = '/api/account_report/' + accountId + '/export' + qs;
-  window.open(url, '_blank');
+  // 使用a标签触发下载，避免弹窗拦截
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = '';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
 }
 
 // ─────────────────────────────────────────────────
@@ -1628,8 +1851,4 @@ setInterval(pollSyncStatus, 10*1000);
 window.addEventListener('resize', ()=>Object.values(S.charts).forEach(ch=>{try{ch.resize();}catch(_){}}));
 </script>
 </body>
-</html>"""
-
-
-if __name__ == "__main__":
-    start_dashboard(8888, debug=True)
+</html>

@@ -136,6 +136,8 @@ def api_material_detail(material_id: str):
     conn.close()
     if not rows:
         return jsonify({"error": "material not found"}), 404
+
+    # Build daily trend
     daily = []
     totals = {"cost": 0, "show": 0, "click": 0, "clue": 0, "consult": 0, "convert": 0}
     for r in rows:
@@ -155,15 +157,56 @@ def api_material_detail(material_id: str):
         totals["clue"] += r["clue_message_count"] or 0
         totals["consult"] += r["message_action_cnt"] or 0
         totals["convert"] += r["convert_cnt"] or 0
-    first = rows[0]
-    return jsonify({
-        "material_id": first["material_id"],
-        "material_name": first["material_name"],
-        "material_type": first["material_type"],
-        "account_id": first["account_id"],
-        "daily": daily,
-        "totals": totals,
-    })
+
+    # Collect attribution info safely (sqlite3.Row has no .get())
+    promos = set()
+    projects = set()
+    first_with_attribution = None
+    for r in rows:
+        try:
+            pid = r["promotion_id"]
+            pname = r["promotion_name"]
+            if pid and pname:
+                promos.add(str(pname))
+                if first_with_attribution is None:
+                    first_with_attribution = r
+        except (IndexError, KeyError):
+            pass
+        try:
+            pjid = r["project_id"]
+            pjname = r["project_name"]
+            if pjid and pjname:
+                projects.add(str(pjname))
+        except (IndexError, KeyError):
+            pass
+
+    # First row for basic info: prefer one with attribution, fall back to first
+    first = first_with_attribution or rows[0]
+
+    # Helper for safe column access
+    def _safe(row, col):
+        try:
+            v = row[col]
+            return str(v) if v else ""
+        except (IndexError, KeyError):
+            return ""
+
+    # Build response dict explicitly (avoid nested comprehension issues)
+    result = {}
+    result["material_id"] = str(first["material_id"])
+    result["material_name"] = str(first["material_name"])
+    result["material_type"] = _safe(first, "material_type")
+    result["account_id"] = str(first["account_id"])
+    result["promotion_id"] = _safe(first, "promotion_id")
+    result["promotion_name"] = _safe(first, "promotion_name")
+    result["project_id"] = _safe(first, "project_id")
+    result["project_name"] = _safe(first, "project_name")
+    result["all_promotions"] = sorted(promos)
+    result["all_projects"] = sorted(projects)
+    result["daily"] = daily
+    result["totals"] = totals
+
+    return jsonify(result)
 
 
 @app.route("/api/material/<material_id>/creative")
@@ -788,7 +831,11 @@ def api_account_report(account_id: str):
             SUM(clue_message_count)  AS clue,
             SUM(message_action_cnt)  AS consult,
             SUM(convert_cnt)         AS convert,
-            COUNT(DISTINCT stat_date) AS active_days
+            COUNT(DISTINCT stat_date) AS active_days,
+            MAX(CASE WHEN promotion_id != '' THEN promotion_id END) as promotion_id,
+            MAX(CASE WHEN promotion_id != '' THEN promotion_name END) as promotion_name,
+            MAX(CASE WHEN project_id != '' THEN project_id END) as project_id,
+            MAX(CASE WHEN project_id != '' THEN project_name END) as project_name
         FROM material_reports
         WHERE account_id = ? AND stat_date BETWEEN ? AND ?
         GROUP BY material_id
@@ -815,6 +862,11 @@ def api_account_report(account_id: str):
             "lead_cost": round(mc / ml, 2) if ml else 0,
             "lead_rate": round(ml / (mcons or 1) * 100, 1),
             "active_days": r["active_days"] or 0,
+            # Attribution (v1.6)
+            "promotion_id": r["promotion_id"] or "",
+            "promotion_name": r["promotion_name"] or "",
+            "project_id": r["project_id"] or "",
+            "project_name": r["project_name"] or "",
         })
 
     conn.close()
@@ -939,12 +991,11 @@ def api_account_report_export(account_id: str):
         ("总展示", f"{show_val:,}"),
         ("总点击", f"{click_val:,}"),
         ("CTR", f"{click_val / (show_val or 1) * 100:.2f}%"),
-        ("总线索(留资)", f"{clue:,}"),
-        ("总咨询", f"{consult:,}"),
-        ("总转化", f"{acc_row['convert'] or 0:,}"),
-        ("转化成本(留资)", f"¥{cost / clue:.0f}" if clue else "--"),
+        ("私信留资", f"{clue:,}"),
+        ("私信咨询", f"{consult:,}"),
+        ("留资成本", f"¥{cost / clue:.0f}" if clue else "--"),
         ("咨询成本", f"¥{cost / consult:.0f}" if consult else "--"),
-        ("留资率", f"{clue / (consult or 1) * 100:.1f}%"),
+        ("留咨率", f"{clue / (consult or 1) * 100:.1f}%"),
         ("活跃天数", f"{acc_row['active_days'] or 0}天"),
     ]
 
@@ -970,15 +1021,14 @@ def api_account_report_export(account_id: str):
         pt = doc.add_table(rows=1, cols=6)
         pt.style = 'Light Grid Accent 1'
         pt.alignment = WD_TABLE_ALIGNMENT.CENTER
-        for i, h in enumerate(["项目名称", "消耗", "线索", "咨询", "转化", "投放单元数"]):
+        for i, h in enumerate(["项目名称", "消耗", "咨询", "留资", "投放单元数"]):
             pt.rows[0].cells[i].text = h
         for r in proj_rows:
             row = pt.add_row()
             row.cells[0].text = r["project_name"] or r["project_id"]
             row.cells[1].text = f'¥{r["cost"]:,.0f}' if r["cost"] else "0"
-            row.cells[2].text = str(r["clue"] or 0)
-            row.cells[3].text = str(r["consult"] or 0)
-            row.cells[4].text = str(r["convert"] or 0)
+            row.cells[2].text = str(r["consult"] or 0)
+            row.cells[3].text = str(r["clue"] or 0)
             row.cells[5].text = str(r["promo_count"] or 0)
     else:
         doc.add_paragraph("（无项目数据）")
@@ -991,7 +1041,7 @@ def api_account_report_export(account_id: str):
         prt = doc.add_table(rows=1, cols=8)
         prt.style = 'Light Grid Accent 1'
         prt.alignment = WD_TABLE_ALIGNMENT.CENTER
-        for i, h in enumerate(["单元名称", "所属项目", "消耗", "展示", "点击", "线索", "转化", "转化成本"]):
+        for i, h in enumerate(["单元名称", "所属项目", "消耗", "展示", "点击", "留资", "留资成本"]):
             prt.rows[0].cells[i].text = h
         for r in promo_rows[:20]:
             row = prt.add_row()
@@ -1002,8 +1052,7 @@ def api_account_report_export(account_id: str):
             row.cells[4].text = str(r["click"] or 0)
             prl_val = r["clue"] or 0
             row.cells[5].text = str(prl_val)
-            row.cells[6].text = str(r["convert"] or 0)
-            row.cells[7].text = f'¥{r["cost"] / prl_val:.0f}' if prl_val and r["cost"] else "--"
+            row.cells[6].text = f'¥{r["cost"] / prl_val:.0f}' if prl_val and r["cost"] else "--"
     else:
         doc.add_paragraph("（无投放单元数据）")
 
@@ -1015,7 +1064,7 @@ def api_account_report_export(account_id: str):
         mt = doc.add_table(rows=1, cols=8)
         mt.style = 'Light Grid Accent 1'
         mt.alignment = WD_TABLE_ALIGNMENT.CENTER
-        for i, h in enumerate(["素材名称", "类型", "消耗", "展示", "点击", "线索", "留资率", "转化成本"]):
+        for i, h in enumerate(["素材名称", "类型", "消耗", "展示", "点击", "线索", "留咨率", "留资成本"]):
             mt.rows[0].cells[i].text = h
         for r in mat_rows[:20]:
             row = mt.add_row()

@@ -696,6 +696,20 @@ def cmd_reconcile(args):
     print()
 
 
+def cmd_verify(args):
+    """验证管道: 检查数据库归属覆盖率、API字段完整性、ETL逻辑."""
+    import subprocess
+    script = PROJECT_ROOT / "scripts" / "verify_pipeline.py"
+    
+    # 从 sys.argv 获取额外参数（日期）
+    date_arg = sys.argv[2] if len(sys.argv) > 2 else None
+    
+    cmd = [sys.executable, str(script)]
+    if date_arg:
+        cmd.append(date_arg)
+    subprocess.run(cmd)
+
+
 # ── CLI ────────────────────────────────────────────────────
 
 COMMAND_MAP = {
@@ -714,6 +728,7 @@ COMMAND_MAP = {
     "单元":      (cmd_promotions,     "投放单元级分析"),
     "账户列表":   (cmd_accounts_list,  "列出所有子账户"),
     "对账":      (cmd_reconcile,     "对账检查: 检测已删除实体缺口"),
+    "验证":      (cmd_verify,        "验证管道: 归属覆盖率+字段完整性+ETL逻辑"),
 }
 
 
